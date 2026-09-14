@@ -1,4 +1,25 @@
 services:
+  db:
+    image: postgres:18
+    container_name: ocr_postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   api:
     build:
@@ -6,7 +27,6 @@ services:
       dockerfile: Dockerfile
 
     container_name: ocr_api
-
     restart: unless-stopped
 
     env_file:
@@ -16,8 +36,6 @@ services:
       DB_HOST: db
       DB_PORT: 5432
 
-      PADDLE_PDX_MODEL_SOURCE: ${PADDLE_PDX_MODEL_SOURCE:-BOS}
-
     ports:
       - "8000:8000"
 
@@ -25,53 +43,5 @@ services:
       db:
         condition: service_healthy
 
-    volumes:
-      - paddle_cache:/root/.paddlex
-
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "python",
-          "-c",
-          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
-        ]
-      interval: 15s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
-
-
-  db:
-    image: postgres:18
-
-    container_name: ocr_postgres
-
-    restart: unless-stopped
-
-    environment:
-      POSTGRES_DB: ${DB_NAME:-ocr_db}
-      POSTGRES_USER: ${DB_USER:-ocr_user}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-ocr_password}
-
-    ports:
-      - "5432:5432"
-
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-
-    healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "pg_isready -U ${DB_USER:-ocr_user} -d ${DB_NAME:-ocr_db}"
-        ]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 20s
-
-
 volumes:
   postgres_data:
-  paddle_cache:

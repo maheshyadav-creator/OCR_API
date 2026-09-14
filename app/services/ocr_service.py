@@ -1,3 +1,7 @@
+import os
+
+os.environ["FLAGS_enable_pir_api"] = "0"
+
 from functools import lru_cache
 from typing import Any
 
@@ -17,6 +21,7 @@ def get_ocr_engine() -> PaddleOCR:
         lang=settings.ocr_lang,
         device=settings.ocr_device,
         engine="paddle",
+        enable_mkldnn=False,
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
         use_textline_orientation=False,
@@ -57,22 +62,13 @@ def perform_ocr(image_path: str) -> dict[str, Any]:
 
     for result in results:
 
-        result_data = make_json_serializable(
-            result.json
-        )
+        result_data = make_json_serializable(result.json)
 
         if "res" in result_data:
             result_data = result_data["res"]
 
-        texts = result_data.get(
-            "rec_texts",
-            [],
-        )
-
-        scores = result_data.get(
-            "rec_scores",
-            [],
-        )
+        texts = result_data.get("rec_texts", [])
+        scores = result_data.get("rec_scores", [])
 
         lines = []
 
@@ -118,18 +114,14 @@ def perform_ocr(image_path: str) -> dict[str, Any]:
     ]
 
     average_confidence = (
-        sum(confidence_values)
-        / len(confidence_values)
+        sum(confidence_values) / len(confidence_values)
         if confidence_values
         else 0.0
     )
 
     return {
         "text": extracted_text,
-        "confidence": round(
-            average_confidence,
-            6,
-        ),
+        "confidence": round(average_confidence, 6),
         "pages": pages,
         "line_count": len(all_lines),
     }

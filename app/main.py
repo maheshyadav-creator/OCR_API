@@ -1,11 +1,12 @@
-import time
-
 from fastapi import FastAPI
-from sqlalchemy import text
 
 from app.core.config import get_settings
-from app.database.connection import check_database_connection, engine
-from app.database.models import Base
+from app.database.connection import (
+    check_database_connection,
+    close_connection_pool,
+    initialize_connection_pool,
+    initialize_database,
+)
 from app.routes.ocr import router as ocr_router
 
 
@@ -15,23 +16,26 @@ settings = get_settings()
 app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
-    description=(
-        "FastAPI OCR service using PaddleOCR and PostgreSQL."
-    ),
+    description="FastAPI OCR service using PaddleOCR and PostgreSQL.",
 )
 
 
 @app.on_event("startup")
 def startup_event() -> None:
     """
-    Create database tables after PostgreSQL becomes available.
+    Initialize the PostgreSQL connection pool and database schema.
     """
 
     max_attempts = 30
 
     for attempt in range(1, max_attempts + 1):
         try:
-            Base.metadata.create_all(bind=engine)
+            initialize_connection_pool()
+
+            if not check_database_connection():
+                raise RuntimeError("PostgreSQL is not accepting connections.")
+
+            initialize_database()
 
             print("PostgreSQL connection established.")
             print("Database tables initialized.")
@@ -44,10 +48,22 @@ def startup_event() -> None:
                 f"{attempt}/{max_attempts} failed: {exc}"
             )
 
+            close_connection_pool()
+
             if attempt == max_attempts:
                 raise
 
-            time.sleep(2)
+    raise RuntimeError("Unable to initialize PostgreSQL database.")
+
+
+@app.on_event("shutdown")
+def shutdown_event() -> None:
+    """
+    Close all PostgreSQL connections when the application stops.
+    """
+
+    close_connection_pool()
+    print("PostgreSQL connection pool closed.")
 
 
 @app.get("/")

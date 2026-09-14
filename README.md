@@ -6,7 +6,7 @@ FastAPI OCR service using:
 - Uvicorn
 - PaddleOCR
 - PostgreSQL
-- SQLAlchemy
+- psycopg2
 - Docker
 - Docker Compose
 
@@ -28,9 +28,7 @@ OCR Service
 PaddleOCR
    |
    v
-OCR Result
+PostgreSQL
    |
-   +----------------+
-   |                |
-   v                v
-PostgreSQL       API Response
+   v
+API Response

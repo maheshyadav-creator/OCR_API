@@ -6,16 +6,22 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     app_name: str = "OCR API"
     app_version: str = "1.0.0"
-    debug: bool = True
+    debug: bool = False
 
-    database_url: str = "sqlite:///./ocr.db"
+    # PostgreSQL configuration
+    db_host: str = "localhost"
+    db_port: int = 5432
+    db_name: str = "ocr_db"
+    db_user: str = "ocr_user"
+    db_password: str = "ocr_password"
 
+    # PaddleOCR configuration
     ocr_lang: str = "en"
     ocr_device: str = "cpu"
-
-    max_file_size_mb: int = 10
-
     paddle_pdx_model_source: str = "BOS"
+
+    # Upload configuration
+    max_file_size_mb: int = 10
 
     model_config = SettingsConfigDict(
         env_file=".env",

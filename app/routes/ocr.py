@@ -1,33 +1,21 @@
-import os
-import tempfile
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, File, HTTPException, UploadFile, status
+from psycopg2.extras import Json
 
 from app.core.config import get_settings
-from app.database.connection import get_db
-from app.database.models import OCRResult
+from app.database.connection import get_db_connection
 from app.schemas.ocr import OCRHistoryItem, OCRResponse
 from app.services.ocr_service import perform_ocr
 
 
 router = APIRouter(
-    prefix="/api/v1/ocr",
+    prefix="/ocr",
     tags=["OCR"],
 )
 
 settings = get_settings()
-
-
-ALLOWED_CONTENT_TYPES = {
-    "image/jpeg": ".jpg",
-    "image/png": ".png",
-    "image/webp": ".webp",
-    "image/tiff": ".tiff",
-    "image/bmp": ".bmp",
-}
 
 
 @router.post(
@@ -35,145 +23,160 @@ ALLOWED_CONTENT_TYPES = {
     response_model=OCRResponse,
     status_code=status.HTTP_201_CREATED,
 )
-def process_ocr(
+async def process_ocr(
     file: UploadFile = File(...),
-    db: Session = Depends(get_db),
 ):
     """
-    Upload an image and run PaddleOCR.
+    Upload an image and extract text using PaddleOCR.
+    The OCR result is stored in PostgreSQL.
     """
 
-    if not file.filename:
+    # Validate content type
+    if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Filename is required.",
-        )
-
-    content_type = file.content_type or ""
-
-    suffix = Path(file.filename).suffix.lower()
-
-    if content_type in ALLOWED_CONTENT_TYPES:
-        suffix = ALLOWED_CONTENT_TYPES[content_type]
-
-    elif suffix not in {
-        ".jpg",
-        ".jpeg",
-        ".png",
-        ".webp",
-        ".tiff",
-        ".tif",
-        ".bmp",
-    }:
-        raise HTTPException(
-            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
             detail="Only image files are supported.",
         )
 
+    # Read uploaded file
+    file_content = await file.read()
+
+    # Validate file size
     max_size = settings.max_file_size_mb * 1024 * 1024
 
-    with tempfile.NamedTemporaryFile(
-        delete=False,
-        suffix=suffix,
-    ) as temp_file:
+    if len(file_content) > max_size:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=(
+                f"File size exceeds the maximum allowed size "
+                f"of {settings.max_file_size_mb} MB."
+            ),
+        )
 
-        total_size = 0
+    filename = file.filename or "unknown"
+    content_type = file.content_type
 
-        while True:
-            chunk = file.file.read(1024 * 1024)
+    # Create temporary image file
+    suffix = Path(filename).suffix or ".jpg"
+    temp_path = None
 
-            if not chunk:
-                break
+    try:
+        with NamedTemporaryFile(
+            delete=False,
+            suffix=suffix,
+        ) as temp_file:
+            temp_file.write(file_content)
+            temp_path = temp_file.name
 
-            total_size += len(chunk)
+        # Perform OCR
+        ocr_result = perform_ocr(temp_path)
 
-            if total_size > max_size:
-                temp_path = temp_file.name
-                temp_file.close()
+        # Save OCR result to PostgreSQL
+        insert_query = """
+            INSERT INTO ocr_results (
+                filename,
+                content_type,
+                extracted_text,
+                confidence,
+                result_json
+            )
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING
+                id,
+                filename,
+                content_type,
+                extracted_text,
+                confidence,
+                result_json,
+                created_at;
+        """
 
-                try:
-                    os.unlink(temp_path)
-                except FileNotFoundError:
-                    pass
-
-                raise HTTPException(
-                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                    detail=(
-                        f"File is too large. Maximum size is "
-                        f"{settings.max_file_size_mb} MB."
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    insert_query,
+                    (
+                        filename,
+                        content_type,
+                        ocr_result["text"],
+                        ocr_result["confidence"],
+                        Json(ocr_result),
                     ),
                 )
 
-            temp_file.write(chunk)
+                row = cursor.fetchone()
 
-        temp_path = temp_file.name
-
-    try:
-        ocr_result = perform_ocr(temp_path)
-
-        database_record = OCRResult(
-            filename=file.filename,
-            content_type=content_type or "application/octet-stream",
-            extracted_text=ocr_result["text"],
-            confidence=ocr_result["confidence"],
-            result_json=ocr_result,
-        )
-
-        db.add(database_record)
-        db.commit()
-        db.refresh(database_record)
+            connection.commit()
 
         return {
-            "id": database_record.id,
-            "filename": database_record.filename,
-            "content_type": database_record.content_type,
-            "extracted_text": database_record.extracted_text,
-            "confidence": database_record.confidence,
-            "result": database_record.result_json,
-            "created_at": database_record.created_at,
+            "id": row[0],
+            "filename": row[1],
+            "content_type": row[2],
+            "extracted_text": row[3],
+            "confidence": row[4],
+            "result": row[5],
+            "created_at": row[6],
         }
 
     except HTTPException:
         raise
 
     except Exception as exc:
-        db.rollback()
-
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"OCR processing failed: {str(exc)}",
         ) from exc
 
     finally:
-        try:
-            os.unlink(temp_path)
-        except FileNotFoundError:
-            pass
+        # Always remove temporary image
+        if temp_path:
+            Path(temp_path).unlink(missing_ok=True)
 
 
 @router.get(
     "/history",
     response_model=list[OCRHistoryItem],
 )
-def get_ocr_history(
-    limit: int = 20,
-    db: Session = Depends(get_db),
-):
+def get_ocr_history():
     """
-    Return previous OCR requests.
+    Return OCR processing history from PostgreSQL.
     """
 
-    limit = min(max(limit, 1), 100)
+    query = """
+        SELECT
+            id,
+            filename,
+            content_type,
+            extracted_text,
+            confidence,
+            created_at
+        FROM ocr_results
+        ORDER BY created_at DESC;
+    """
 
-    query = (
-        select(OCRResult)
-        .order_by(OCRResult.created_at.desc())
-        .limit(limit)
-    )
+    try:
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(query)
+                rows = cursor.fetchall()
 
-    records = db.scalars(query).all()
+        return [
+            {
+                "id": row[0],
+                "filename": row[1],
+                "content_type": row[2],
+                "extracted_text": row[3],
+                "confidence": row[4],
+                "created_at": row[5],
+            }
+            for row in rows
+        ]
 
-    return records
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve OCR history: {str(exc)}",
+        ) from exc
 
 
 @router.get(
@@ -182,26 +185,51 @@ def get_ocr_history(
 )
 def get_ocr_result(
     ocr_id: int,
-    db: Session = Depends(get_db),
 ):
     """
-    Get one OCR result by ID.
+    Return a single OCR result from PostgreSQL.
     """
 
-    record = db.get(OCRResult, ocr_id)
+    query = """
+        SELECT
+            id,
+            filename,
+            content_type,
+            extracted_text,
+            confidence,
+            result_json,
+            created_at
+        FROM ocr_results
+        WHERE id = %s;
+    """
 
-    if not record:
+    try:
+        with get_db_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(query, (ocr_id,))
+                row = cursor.fetchone()
+
+        if row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="OCR result not found.",
+            )
+
+        return {
+            "id": row[0],
+            "filename": row[1],
+            "content_type": row[2],
+            "extracted_text": row[3],
+            "confidence": row[4],
+            "result": row[5],
+            "created_at": row[6],
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="OCR result not found.",
-        )
-
-    return {
-        "id": record.id,
-        "filename": record.filename,
-        "content_type": record.content_type,
-        "extracted_text": record.extracted_text,
-        "confidence": record.confidence,
-        "result": record.result_json,
-        "created_at": record.created_at,
-    }
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve OCR result: {str(exc)}",
+        ) from exc

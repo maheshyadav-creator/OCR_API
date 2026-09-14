@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field
 
 
 class OCRLine(BaseModel):
@@ -14,11 +14,9 @@ class OCRResponse(BaseModel):
     filename: str
     content_type: str
     extracted_text: str
-    confidence: float
+    confidence: float = Field(ge=0.0, le=1.0)
     result: dict[str, Any]
     created_at: datetime
-
-    model_config = ConfigDict(from_attributes=True)
 
 
 class OCRHistoryItem(BaseModel):
@@ -26,10 +24,8 @@ class OCRHistoryItem(BaseModel):
     filename: str
     content_type: str
     extracted_text: str
-    confidence: float
+    confidence: float = Field(ge=0.0, le=1.0)
     created_at: datetime
-
-    model_config = ConfigDict(from_attributes=True)
 
 
 class HealthResponse(BaseModel):

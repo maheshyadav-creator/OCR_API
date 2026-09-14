@@ -2,13 +2,10 @@ FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
-
-# Paddle/PaddleOCR configuration
 ENV PADDLE_PDX_MODEL_SOURCE=BOS
 
 WORKDIR /app
 
-# Runtime libraries required by PaddleOCR/OpenCV
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libgl1 \
@@ -31,11 +28,4 @@ RUN mkdir -p /app/storage
 
 EXPOSE 8000
 
-CMD [
-    "uvicorn",
-    "app.main:app",
-    "--host",
-    "0.0.0.0",
-    "--port",
-    "8000"
-]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
