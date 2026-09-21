@@ -2,12 +2,14 @@ FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
-ENV PADDLE_PDX_MODEL_SOURCE=BOS
+ENV FLAGS_use_cuda=0
+ENV FLAGS_use_mkldnn=0
 
 WORKDIR /app
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        cron \
         libgl1 \
         libglib2.0-0 \
         libgomp1 \
@@ -25,6 +27,12 @@ RUN python -m pip install --upgrade pip \
 COPY app ./app
 
 RUN mkdir -p /app/storage
+
+COPY docker/ocr-recovery-cron /etc/cron.d/ocr-recovery-cron
+
+RUN sed -i 's/\r$//' /etc/cron.d/ocr-recovery-cron \
+    && chmod 0644 /etc/cron.d/ocr-recovery-cron \
+    && printf '\n' >> /etc/cron.d/ocr-recovery-cron
 
 EXPOSE 8000
 

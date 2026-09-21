@@ -1,4 +1,5 @@
 services:
+
   db:
     image: postgres:18
     container_name: ocr_postgres
@@ -21,6 +22,22 @@ services:
       timeout: 5s
       retries: 10
 
+
+  redis:
+    image: redis:7-alpine
+    container_name: ocr_redis
+    restart: unless-stopped
+
+    ports:
+      - "6379:6379"
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+
   api:
     build:
       context: .
@@ -35,13 +52,132 @@ services:
     environment:
       DB_HOST: db
       DB_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
 
     ports:
       - "8000:8000"
 
+    volumes:
+      - ocr_storage:/app/storage
+
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+
+
+  ocr_worker_1:
+    image: ocr_api-ocr_worker:latest
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+
+    volumes:
+      - ocr_storage:/app/storage
+
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+    command: ["python", "-m", "app.worker.ocr_worker"]
+
+
+  ocr_worker_2:
+    image: ocr_api-ocr_worker:latest
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+
+    volumes:
+      - ocr_storage:/app/storage
+
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+    command: ["python", "-m", "app.worker.ocr_worker"]
+
+
+  ocr_worker_3:
+    image: ocr_api-ocr_worker:latest
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+
+    volumes:
+      - ocr_storage:/app/storage
+
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+    command: ["python", "-m", "app.worker.ocr_worker"]
+
+
+  cron:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: ocr_cron
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+
+    volumes:
+      - ocr_storage:/app/storage
+
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+    command:
+        - sh
+        - -c
+        - |
+         env | grep -E '^(DB_|REDIS_)' | sed 's/^/export /' > /etc/ocr-cron.env
+         chmod 600 /etc/ocr-cron.env
+         exec cron -f
+
 
 volumes:
   postgres_data:
+  ocr_storage:

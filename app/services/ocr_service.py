@@ -1,11 +1,7 @@
-import os
-
-os.environ["FLAGS_enable_pir_api"] = "0"
-
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
-import numpy as np
 from paddleocr import PaddleOCR
 
 from app.core.config import get_settings
@@ -13,115 +9,110 @@ from app.core.config import get_settings
 
 @lru_cache(maxsize=1)
 def get_ocr_engine() -> PaddleOCR:
+    """
+    Create and cache one PaddleOCR engine.
+
+    The engine is created only once per worker process.
+    """
+
     settings = get_settings()
 
-    print("Loading PaddleOCR...")
+    print("Loading PaddleOCR 3.7 CPU engine...")
 
     return PaddleOCR(
         lang=settings.ocr_lang,
         device=settings.ocr_device,
-        engine="paddle",
         enable_mkldnn=False,
-        use_doc_orientation_classify=False,
-        use_doc_unwarping=False,
-        use_textline_orientation=False,
+        cpu_threads=4,
     )
 
 
-def make_json_serializable(value: Any) -> Any:
-
-    if isinstance(value, dict):
-        return {
-            str(key): make_json_serializable(item)
-            for key, item in value.items()
-        }
-
-    if isinstance(value, (list, tuple)):
-        return [
-            make_json_serializable(item)
-            for item in value
-        ]
-
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-
-    if isinstance(value, np.generic):
-        return value.item()
-
-    return value
-
-
-def perform_ocr(image_path: str) -> dict[str, Any]:
+def perform_ocr(file_path: str) -> dict[str, Any]:
+    """
+    Run PaddleOCR on an image or PDF file.
+    """
 
     ocr = get_ocr_engine()
 
-    results = ocr.predict(image_path)
+    print(f"Running OCR on: {file_path}")
 
-    pages = []
-    all_lines = []
+    results = ocr.predict(file_path)
 
-    for result in results:
+    pages: list[dict[str, Any]] = []
+    all_text: list[str] = []
+    confidence_values: list[float] = []
 
-        result_data = make_json_serializable(result.json)
+    for page_number, result in enumerate(
+        results,
+        start=1,
+    ):
+        result_data = result.json
 
-        if "res" in result_data:
-            result_data = result_data["res"]
+        if not isinstance(result_data, dict):
+            result_data = {}
 
-        texts = result_data.get("rec_texts", [])
-        scores = result_data.get("rec_scores", [])
+        data = result_data.get(
+            "res",
+            result_data,
+        )
 
-        lines = []
+        if not isinstance(data, dict):
+            data = {}
 
-        for index, text in enumerate(texts):
+        texts = data.get(
+            "rec_texts",
+            [],
+        )
+
+        scores = data.get(
+            "rec_scores",
+            [],
+        )
+
+        page_text_parts: list[str] = []
+
+        for text, score in zip(texts, scores):
 
             text = str(text).strip()
+            confidence = float(score)
 
             if not text:
                 continue
 
-            try:
-                score = float(scores[index])
-            except (IndexError, TypeError, ValueError):
-                score = 0.0
+            page_text_parts.append(text)
+            confidence_values.append(confidence)
 
-            line = {
-                "text": text,
-                "confidence": round(score, 6),
-            }
-
-            lines.append(line)
-            all_lines.append(line)
+        page_text = "\n".join(
+            page_text_parts
+        )
 
         pages.append(
             {
-                "text": "\n".join(
-                    line["text"]
-                    for line in lines
-                ),
-                "lines": lines,
+                "page": page_number,
+                "text": page_text,
                 "raw": result_data,
             }
         )
 
-    extracted_text = "\n".join(
-        line["text"]
-        for line in all_lines
+        if page_text:
+            all_text.append(page_text)
+
+    extracted_text = "\n\n".join(
+        all_text
     )
 
-    confidence_values = [
-        line["confidence"]
-        for line in all_lines
-    ]
-
-    average_confidence = (
-        sum(confidence_values) / len(confidence_values)
-        if confidence_values
-        else 0.0
-    )
+    if confidence_values:
+        average_confidence = (
+            sum(confidence_values)
+            / len(confidence_values)
+        )
+    else:
+        average_confidence = 0.0
 
     return {
         "text": extracted_text,
-        "confidence": round(average_confidence, 6),
         "pages": pages,
-        "line_count": len(all_lines),
+        "page_count": len(pages),
+        "confidence": average_confidence,
+        "file_name": Path(file_path).name,
     }

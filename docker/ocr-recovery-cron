@@ -1,0 +1,1 @@
+*/5 * * * * root . /etc/ocr-cron.env && cd /app && /usr/local/bin/python -m app.worker.cron_recovery >> /var/log/ocr-cron.log 2>&1

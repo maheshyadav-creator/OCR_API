@@ -1,19 +1,20 @@
 fastapi==0.116.1
 uvicorn[standard]==0.35.0
-
 psycopg2-binary==2.9.10
-
 pydantic==2.11.7
 pydantic-settings==2.10.1
-
 python-multipart==0.0.20
 python-dotenv==1.1.1
 
 paddlepaddle==3.3.1
 paddleocr==3.7.0
 
-numpy==2.2.6
+numpy==1.26.4
 pillow==11.3.0
+opencv-python-headless==4.10.0.84
+PyMuPDF==1.24.14
 
+redis==5.0.1
 pytest==8.4.1
 httpx==0.28.1
+chardet==5.2.0

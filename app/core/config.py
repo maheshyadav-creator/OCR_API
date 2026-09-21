@@ -8,20 +8,28 @@ class Settings(BaseSettings):
     app_version: str = "1.0.0"
     debug: bool = False
 
-    # PostgreSQL configuration
+    # PostgreSQL
     db_host: str = "localhost"
     db_port: int = 5432
     db_name: str = "ocr_db"
     db_user: str = "ocr_user"
     db_password: str = "ocr_password"
 
-    # PaddleOCR configuration
+    # OCR
     ocr_lang: str = "en"
     ocr_device: str = "cpu"
-    paddle_pdx_model_source: str = "BOS"
 
-    # Upload configuration
-    max_file_size_mb: int = 10
+    # Redis
+    redis_host: str = "redis"
+    redis_port: int = 6379
+
+    # Upload limits
+    max_file_size_mb: int = 25
+
+    # Supported upload formats
+    allowed_extensions: str = (
+        ".jpg,.jpeg,.png,.bmp,.webp,.tif,.tiff,.pdf"
+    )
 
     model_config = SettingsConfigDict(
         env_file=".env",

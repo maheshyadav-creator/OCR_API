@@ -1,13 +1,26 @@
 from pathlib import Path
-from tempfile import NamedTemporaryFile
+from uuid import UUID, uuid4
 
-from fastapi import APIRouter, File, HTTPException, UploadFile, status
-from psycopg2.extras import Json
+from fastapi import (
+    APIRouter,
+    File,
+    HTTPException,
+    UploadFile,
+    status,
+)
 
 from app.core.config import get_settings
 from app.database.connection import get_db_connection
-from app.schemas.ocr import OCRHistoryItem, OCRResponse
-from app.services.ocr_service import perform_ocr
+from app.queue.redis_queue import enqueue_ocr_job
+from app.schemas.ocr import (
+    OCRBatchResponse,
+    OCRHistoryItem,
+    OCRJobResponse,
+    OCRJobStatusResponse,
+    OCRResponse,
+)
+from app.services.file_service import validate_uploaded_file
+from app.services.storage_service import save_uploaded_file
 
 
 router = APIRouter(
@@ -18,120 +31,233 @@ router = APIRouter(
 settings = get_settings()
 
 
+# ============================================================
+# Create OCR jobs
+# ============================================================
+
 @router.post(
     "",
-    response_model=OCRResponse,
-    status_code=status.HTTP_201_CREATED,
+    response_model=OCRBatchResponse,
+    status_code=status.HTTP_202_ACCEPTED,
 )
 async def process_ocr(
-    file: UploadFile = File(...),
+    files: list[UploadFile] = File(...),
 ):
     """
-    Upload an image and extract text using PaddleOCR.
-    The OCR result is stored in PostgreSQL.
+    Accept multiple images or PDFs and create asynchronous
+    OCR jobs for each uploaded file.
     """
 
-    # Validate content type
-    if not file.content_type or not file.content_type.startswith("image/"):
+    # --------------------------------------------------------
+    # 1. Make sure at least one file was uploaded
+    # --------------------------------------------------------
+
+    if not files:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only image files are supported.",
+            detail="At least one file is required.",
         )
 
-    # Read uploaded file
-    file_content = await file.read()
+    # --------------------------------------------------------
+    # 2. Validate ALL file types before creating jobs
+    # --------------------------------------------------------
 
-    # Validate file size
-    max_size = settings.max_file_size_mb * 1024 * 1024
+    for file in files:
+        validate_uploaded_file(file)
 
-    if len(file_content) > max_size:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=(
-                f"File size exceeds the maximum allowed size "
-                f"of {settings.max_file_size_mb} MB."
-            ),
+    # --------------------------------------------------------
+    # 3. Calculate maximum upload size
+    # --------------------------------------------------------
+
+    max_size_bytes = (
+        settings.max_file_size_mb * 1024 * 1024
+    )
+
+    created_jobs: list[OCRJobResponse] = []
+
+    # --------------------------------------------------------
+    # 4. Process every uploaded file independently
+    # --------------------------------------------------------
+
+    for file in files:
+
+        job_id = uuid4()
+
+        filename = (
+            file.filename
+            or "unknown"
         )
 
-    filename = file.filename or "unknown"
-    content_type = file.content_type
+        content_type = (
+            file.content_type
+            or "application/octet-stream"
+        )
 
-    # Create temporary image file
-    suffix = Path(filename).suffix or ".jpg"
-    temp_path = None
+        file_path = None
 
-    try:
-        with NamedTemporaryFile(
-            delete=False,
-            suffix=suffix,
-        ) as temp_file:
-            temp_file.write(file_content)
-            temp_path = temp_file.name
+        try:
 
-        # Perform OCR
-        ocr_result = perform_ocr(temp_path)
+            # ------------------------------------------------
+            # 5. Save this file
+            # ------------------------------------------------
 
-        # Save OCR result to PostgreSQL
-        insert_query = """
-            INSERT INTO ocr_results (
-                filename,
-                content_type,
-                extracted_text,
-                confidence,
-                result_json
+            file_path, _ = await save_uploaded_file(
+                job_id=job_id,
+                filename=filename,
+                file=file,
+                max_size_bytes=max_size_bytes,
             )
-            VALUES (%s, %s, %s, %s, %s)
-            RETURNING
-                id,
-                filename,
-                content_type,
-                extracted_text,
-                confidence,
-                result_json,
-                created_at;
-        """
 
-        with get_db_connection() as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    insert_query,
-                    (
-                        filename,
-                        content_type,
-                        ocr_result["text"],
-                        ocr_result["confidence"],
-                        Json(ocr_result),
+            # ------------------------------------------------
+            # 6. Create PostgreSQL job
+            # ------------------------------------------------
+
+            insert_query = """
+                INSERT INTO ocr_jobs (
+                    id,
+                    filename,
+                    content_type,
+                    file_path,
+                    status
+                )
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING
+                    id,
+                    filename,
+                    content_type,
+                    status,
+                    created_at;
+            """
+
+            with get_db_connection() as connection:
+
+                with connection.cursor() as cursor:
+
+                    cursor.execute(
+                        insert_query,
+                        (
+                            str(job_id),
+                            filename,
+                            content_type,
+                            file_path,
+                            "queued",
+                        ),
+                    )
+
+                    row = cursor.fetchone()
+
+                connection.commit()
+
+            # ------------------------------------------------
+            # 7. Add this job to Redis
+            # ------------------------------------------------
+
+            enqueue_ocr_job(
+                job_id=str(job_id),
+                file_path=file_path,
+                filename=filename,
+                content_type=content_type,
+            )
+
+            # ------------------------------------------------
+            # 8. Add this job to the batch response
+            # ------------------------------------------------
+
+            created_jobs.append(
+                OCRJobResponse(
+                    job_id=str(row[0]),
+                    filename=row[1],
+                    content_type=row[2],
+                    status=row[3],
+                    created_at=row[4],
+                )
+            )
+
+        except ValueError as exc:
+
+            # ------------------------------------------------
+            # File size error
+            # ------------------------------------------------
+
+            if str(exc) == "FILE_TOO_LARGE":
+
+                if file_path:
+                    Path(file_path).unlink(
+                        missing_ok=True
+                    )
+
+                raise HTTPException(
+                    status_code=(
+                        status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
                     ),
+                    detail=(
+                        f"File '{filename}' exceeds "
+                        f"the maximum allowed size "
+                        f"of {settings.max_file_size_mb} MB."
+                    ),
+                ) from exc
+
+            # Unknown ValueError
+            raise
+
+        except Exception as exc:
+
+            # ------------------------------------------------
+            # Log unexpected error
+            # ------------------------------------------------
+
+            import traceback
+
+            print(
+                "========== OCR JOB ERROR =========="
+            )
+            print(
+                f"FILE: {filename}"
+            )
+            print(
+                f"ERROR TYPE: {type(exc).__name__}"
+            )
+            print(
+                f"ERROR MESSAGE: {exc}"
+            )
+
+            traceback.print_exc()
+
+            print(
+                "==================================="
+            )
+
+            # ------------------------------------------------
+            # Remove file if it was saved
+            # ------------------------------------------------
+
+            if file_path:
+                Path(file_path).unlink(
+                    missing_ok=True
                 )
 
-                row = cursor.fetchone()
+            raise HTTPException(
+                status_code=(
+                    status.HTTP_500_INTERNAL_SERVER_ERROR
+                ),
+                detail=(
+                    f"Failed to create OCR job "
+                    f"for file '{filename}'."
+                ),
+            ) from exc
 
-            connection.commit()
+    # --------------------------------------------------------
+    # 9. Return all created jobs
+    # --------------------------------------------------------
 
-        return {
-            "id": row[0],
-            "filename": row[1],
-            "content_type": row[2],
-            "extracted_text": row[3],
-            "confidence": row[4],
-            "result": row[5],
-            "created_at": row[6],
-        }
+    return {
+        "jobs": created_jobs
+    }
 
-    except HTTPException:
-        raise
 
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"OCR processing failed: {str(exc)}",
-        ) from exc
-
-    finally:
-        # Always remove temporary image
-        if temp_path:
-            Path(temp_path).unlink(missing_ok=True)
-
+# ============================================================
+# OCR history
+# ============================================================
 
 @router.get(
     "/history",
@@ -139,12 +265,13 @@ async def process_ocr(
 )
 def get_ocr_history():
     """
-    Return OCR processing history from PostgreSQL.
+    Return completed OCR results.
     """
 
     query = """
         SELECT
             id,
+            job_id,
             filename,
             content_type,
             extracted_text,
@@ -154,40 +281,45 @@ def get_ocr_history():
         ORDER BY created_at DESC;
     """
 
-    try:
-        with get_db_connection() as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(query)
-                rows = cursor.fetchall()
+    with get_db_connection() as connection:
 
-        return [
-            {
-                "id": row[0],
-                "filename": row[1],
-                "content_type": row[2],
-                "extracted_text": row[3],
-                "confidence": row[4],
-                "created_at": row[5],
-            }
-            for row in rows
-        ]
+        with connection.cursor() as cursor:
 
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to retrieve OCR history: {str(exc)}",
-        ) from exc
+            cursor.execute(query)
 
+            rows = cursor.fetchall()
+
+    return [
+        {
+            "id": row[0],
+            "job_id": (
+                str(row[1])
+                if row[1]
+                else None
+            ),
+            "filename": row[2],
+            "content_type": row[3],
+            "extracted_text": row[4],
+            "confidence": row[5],
+            "created_at": row[6],
+        }
+        for row in rows
+    ]
+
+
+# ============================================================
+# Get OCR job status
+# ============================================================
 
 @router.get(
-    "/{ocr_id}",
-    response_model=OCRResponse,
+    "/{job_id}",
+    response_model=OCRJobStatusResponse,
 )
-def get_ocr_result(
-    ocr_id: int,
+def get_ocr_job_status(
+    job_id: UUID,
 ):
     """
-    Return a single OCR result from PostgreSQL.
+    Return the current status of an OCR job.
     """
 
     query = """
@@ -195,41 +327,108 @@ def get_ocr_result(
             id,
             filename,
             content_type,
+            status,
+            attempt_count,
+            error_message,
+            created_at,
+            started_at,
+            completed_at
+        FROM ocr_jobs
+        WHERE id = %s;
+    """
+
+    with get_db_connection() as connection:
+
+        with connection.cursor() as cursor:
+
+            cursor.execute(
+                query,
+                (str(job_id),),
+            )
+
+            row = cursor.fetchone()
+
+    if row is None:
+
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="OCR job not found.",
+        )
+
+    return {
+        "job_id": str(row[0]),
+        "filename": row[1],
+        "content_type": row[2],
+        "status": row[3],
+        "attempt_count": row[4],
+        "error_message": row[5],
+        "created_at": row[6],
+        "started_at": row[7],
+        "completed_at": row[8],
+    }
+
+
+# ============================================================
+# Get OCR result
+# ============================================================
+
+@router.get(
+    "/{job_id}/result",
+    response_model=OCRResponse,
+)
+def get_ocr_result(
+    job_id: UUID,
+):
+    """
+    Return the OCR result for a completed job.
+    """
+
+    query = """
+        SELECT
+            id,
+            job_id,
+            filename,
+            content_type,
             extracted_text,
             confidence,
             result_json,
             created_at
         FROM ocr_results
-        WHERE id = %s;
+        WHERE job_id = %s;
     """
 
-    try:
-        with get_db_connection() as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(query, (ocr_id,))
-                row = cursor.fetchone()
+    with get_db_connection() as connection:
 
-        if row is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="OCR result not found.",
+        with connection.cursor() as cursor:
+
+            cursor.execute(
+                query,
+                (str(job_id),),
             )
 
-        return {
-            "id": row[0],
-            "filename": row[1],
-            "content_type": row[2],
-            "extracted_text": row[3],
-            "confidence": row[4],
-            "result": row[5],
-            "created_at": row[6],
-        }
+            row = cursor.fetchone()
 
-    except HTTPException:
-        raise
+    if row is None:
 
-    except Exception as exc:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to retrieve OCR result: {str(exc)}",
-        ) from exc
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                "OCR result not found. "
+                "The job may still be processing."
+            ),
+        )
+
+    return {
+        "id": row[0],
+        "job_id": (
+            str(row[1])
+            if row[1]
+            else None
+        ),
+        "filename": row[2],
+        "content_type": row[3],
+        "extracted_text": row[4],
+        "confidence": row[5],
+        "result": row[6],
+        "created_at": row[7],
+    }
