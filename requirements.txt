@@ -18,3 +18,5 @@ redis==5.0.1
 pytest==8.4.1
 httpx==0.28.1
 chardet==5.2.0
+pypdf==6.19.0
+psutil==7.0.0

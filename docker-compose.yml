@@ -69,7 +69,7 @@ services:
 
 
   ocr_worker_1:
-    image: ocr_api-ocr_worker:latest
+    image: ocr_api-api:latest
     restart: unless-stopped
 
     env_file:
@@ -94,7 +94,7 @@ services:
 
 
   ocr_worker_2:
-    image: ocr_api-ocr_worker:latest
+    image: ocr_api-api:latest
     restart: unless-stopped
 
     env_file:
@@ -119,7 +119,7 @@ services:
 
 
   ocr_worker_3:
-    image: ocr_api-ocr_worker:latest
+    image: ocr_api-api:latest
     restart: unless-stopped
 
     env_file:
