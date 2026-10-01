@@ -1,5 +1,9 @@
 services:
 
+  # ==========================================================
+  # PostgreSQL
+  # ==========================================================
+
   db:
     image: postgres:18
     container_name: ocr_postgres
@@ -17,11 +21,19 @@ services:
       - postgres_data:/var/lib/postgresql
 
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${DB_USER} -d ${DB_NAME}"
+        ]
       interval: 5s
       timeout: 5s
       retries: 10
 
+
+  # ==========================================================
+  # Redis
+  # ==========================================================
 
   redis:
     image: redis:7-alpine
@@ -32,11 +44,20 @@ services:
       - "6379:6379"
 
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test:
+        [
+          "CMD",
+          "redis-cli",
+          "ping"
+        ]
       interval: 5s
       timeout: 5s
       retries: 10
 
+
+  # ==========================================================
+  # FastAPI
+  # ==========================================================
 
   api:
     build:
@@ -68,6 +89,10 @@ services:
         condition: service_healthy
 
 
+  # ==========================================================
+  # Production Worker 1
+  # ==========================================================
+
   ocr_worker_1:
     image: ocr_api-api:latest
     restart: unless-stopped
@@ -90,8 +115,17 @@ services:
       redis:
         condition: service_healthy
 
-    command: ["python", "-m", "app.worker.ocr_worker"]
+    command:
+      [
+        "python",
+        "-m",
+        "app.worker.ocr_worker"
+      ]
 
+
+  # ==========================================================
+  # Production Worker 2
+  # ==========================================================
 
   ocr_worker_2:
     image: ocr_api-api:latest
@@ -115,8 +149,17 @@ services:
       redis:
         condition: service_healthy
 
-    command: ["python", "-m", "app.worker.ocr_worker"]
+    command:
+      [
+        "python",
+        "-m",
+        "app.worker.ocr_worker"
+      ]
 
+
+  # ==========================================================
+  # Production Worker 3
+  # ==========================================================
 
   ocr_worker_3:
     image: ocr_api-api:latest
@@ -140,8 +183,17 @@ services:
       redis:
         condition: service_healthy
 
-    command: ["python", "-m", "app.worker.ocr_worker"]
+    command:
+      [
+        "python",
+        "-m",
+        "app.worker.ocr_worker"
+      ]
 
+
+  # ==========================================================
+  # Cron / Recovery
+  # ==========================================================
 
   cron:
     build:
@@ -170,14 +222,20 @@ services:
         condition: service_healthy
 
     command:
-        - sh
-        - -c
-        - |
-         env | grep -E '^(DB_|REDIS_)' | sed 's/^/export /' > /etc/ocr-cron.env
-         chmod 600 /etc/ocr-cron.env
-         exec cron -f
+      - sh
+      - -c
+      - |
+        env | grep -E '^(DB_|REDIS_)' | sed 's/^/export /' > /etc/ocr-cron.env
+        chmod 600 /etc/ocr-cron.env
+        exec cron -f
 
+
+# ============================================================
+# Docker Volumes
+# ============================================================
 
 volumes:
+
   postgres_data:
+
   ocr_storage:

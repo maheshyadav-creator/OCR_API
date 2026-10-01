@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import csv
-import json
 import os
+import signal
+import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -11,923 +13,830 @@ from typing import Any
 import psutil
 from pypdf import PdfReader
 
-from app.services.ocr_service import get_ocr_engine, perform_ocr
+from app.database.connection import (
+    close_connection_pool,
+    initialize_connection_pool,
+)
+from app.worker.job_processor import process_message
+from app.worker.redis_consumer import (
+    OCR_CONSUMER_GROUP,
+    OCR_STREAM_NAME,
+    create_consumer_group,
+    redis_client,
+)
+from app.worker.retry_handler import handle_failed_message
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-PROJECT_ROOT = Path("/home/mahesh/Documents/OCR_API")
-PDF_DIR = PROJECT_ROOT / "test_pdf"
-RESULTS_DIR = PROJECT_ROOT / "benchmark_results"
+# IMPORTANT:
+# Exactly TWO OCR jobs may be actively processed by this
+# benchmark worker.
+CONCURRENCY = int(
+    os.getenv("BENCHMARK_CONCURRENCY", "2")
+)
 
-BENCHMARK_LIMIT = int(os.getenv("BENCHMARK_LIMIT", "10"))
+# Redis waits for new jobs for this amount of time.
+REDIS_BLOCK_MS = int(
+    os.getenv("BENCHMARK_REDIS_BLOCK_MS", "1000")
+)
 
-# This benchmark intentionally uses ONE Python process / ONE OCR engine.
-WORKER_ID = "worker_1"
-WORKER_COUNT = 1
+# Redis will return at most this many jobs in one read.
+# We keep it equal to the number of available slots.
+REDIS_COUNT = int(
+    os.getenv("BENCHMARK_REDIS_COUNT", "2")
+)
 
-CSV_PATH = RESULTS_DIR / "per_document.csv"
-SUMMARY_PATH = RESULTS_DIR / "summary.json"
-BENCHMARK_PATH = RESULTS_DIR / "benchmark.json"
+# Fixed benchmark worker identity.
+#
+# This is intentionally NOT the hostname because we want
+# the worker identity to be obvious in PostgreSQL.
+BENCHMARK_WORKER_ID = os.getenv(
+    "BENCHMARK_WORKER_ID",
+    "benchmark_single_worker",
+)
+
+# Output directory.
+RESULTS_DIR = Path(
+    os.getenv(
+        "BENCHMARK_RESULTS_DIR",
+        "/app/benchmark_results",
+    )
+)
+
+CSV_FILE = RESULTS_DIR / "benchmark_worker_jobs.csv"
+
+# Worker stop event.
+STOP_EVENT = threading.Event()
+
+
+# ============================================================
+# PROCESS RESOURCE MONITOR
+# ============================================================
+
+PROCESS = psutil.Process(os.getpid())
+
+# Used to calculate CPU time per benchmark job.
+PROCESS_RESOURCE_LOCK = threading.Lock()
+
+
+# ============================================================
+# METRICS
+# ============================================================
+
+RESULTS_LOCK = threading.Lock()
+
+RESULTS: list[dict[str, Any]] = []
+
+
+# ============================================================
+# SIGNAL HANDLING
+# ============================================================
+
+def handle_shutdown_signal(
+    signum: int,
+    frame: Any,
+) -> None:
+
+    print()
+    print("=" * 70)
+    print(
+        f"Shutdown signal received: {signum}"
+    )
+    print(
+        "Benchmark worker will stop accepting new jobs."
+    )
+    print(
+        "Currently running OCR jobs will finish."
+    )
+    print("=" * 70)
+
+    STOP_EVENT.set()
 
 
 # ============================================================
 # HELPERS
 # ============================================================
 
-def utc_timestamp() -> str:
-    """Return an ISO-8601 UTC timestamp."""
-    return datetime.now(timezone.utc).isoformat()
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-def mb(value: float) -> float:
-    """Convert bytes to MB."""
-    return value / (1024 * 1024)
+def iso_now() -> str:
+    return utc_now().isoformat()
 
 
-def get_process() -> psutil.Process:
-    """Return the current Python process."""
-    return psutil.Process(os.getpid())
-
-
-def get_logical_cpu_count() -> int:
-    """Return the number of logical CPUs visible to this process."""
-    return psutil.cpu_count(logical=True) or 1
-
-
-def get_pdf_page_count(pdf_path: Path) -> int:
-    """
-    Read PDF metadata and return page count.
-
-    This happens OUTSIDE the OCR timing.
-    """
-    reader = PdfReader(str(pdf_path))
-    return len(reader.pages)
-
-
-def get_pdf_size(pdf_path: Path) -> int:
-    """Return PDF size in bytes."""
-    return pdf_path.stat().st_size
-
-
-def discover_pdfs() -> list[Path]:
-    """
-    Find benchmark PDFs.
-
-    Only files matching ocr_test_*.pdf are included.
-    """
-    if not PDF_DIR.exists():
-        raise FileNotFoundError(
-            f"PDF directory does not exist: {PDF_DIR}"
-        )
-
-    pdfs = sorted(PDF_DIR.glob("ocr_test_*.pdf"))
-
-    if not pdfs:
-        raise FileNotFoundError(
-            f"No benchmark PDFs found in: {PDF_DIR}"
-        )
-
-    return pdfs[:BENCHMARK_LIMIT]
-
-
-def safe_float(value: Any) -> float | None:
-    """Convert a value to float safely."""
-    if value is None:
-        return None
+def get_pdf_page_count(
+    file_path: str,
+) -> int:
 
     try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+        reader = PdfReader(file_path)
+        return len(reader.pages)
 
-
-# ============================================================
-# MODEL INITIALIZATION
-# ============================================================
-
-def initialize_ocr_engine() -> float:
-    """
-    Initialize the cached PaddleOCR engine.
-
-    Model initialization is measured separately and is NOT included
-    in per-document OCR wall time.
-    """
-    print()
-    print("=" * 70)
-    print("INITIALIZING PADDLEOCR")
-    print("=" * 70)
-
-    start = time.perf_counter()
-
-    get_ocr_engine()
-
-    elapsed = time.perf_counter() - start
-
-    print(f"Model initialization completed in: {elapsed:.3f} sec")
-
-    return elapsed
-
-
-# ============================================================
-# SINGLE DOCUMENT BENCHMARK
-# ============================================================
-
-def benchmark_document(
-    pdf_path: Path,
-    document_number: int,
-) -> dict[str, Any]:
-    """
-    Run OCR on one PDF and collect benchmark metrics.
-
-    Important:
-    - PDF size/page count are collected before OCR timing.
-    - OCR engine is already initialized.
-    - OCR is executed sequentially.
-    - No Redis.
-    - No PostgreSQL.
-    - No API request.
-    """
-
-    process = get_process()
-
-    size_bytes = get_pdf_size(pdf_path)
-    size_kb = size_bytes / 1024
-    size_mb = mb(size_bytes)
-
-    try:
-        page_count = get_pdf_page_count(pdf_path)
-        page_count_input = page_count
     except Exception as exc:
         print(
-            f"WARNING: Could not read page count for "
-            f"{pdf_path.name}: {exc}"
+            f"Could not read PDF page count: "
+            f"{file_path} ({exc})"
         )
-        page_count = None
-        page_count_input = None
+        return 0
 
-    print()
-    print("-" * 70)
-    print(f"DOCUMENT {document_number}")
-    print("-" * 70)
-    print(f"File       : {pdf_path.name}")
-    print(f"Size       : {size_mb:.3f} MB")
-    print(f"Pages      : {page_count}")
-    print(f"Worker     : {WORKER_ID}")
 
-    # --------------------------------------------------------
-    # Memory before OCR
-    # --------------------------------------------------------
-
-    ram_before_bytes = process.memory_info().rss
-    ram_before_mb = mb(ram_before_bytes)
-
-    # --------------------------------------------------------
-    # CPU time before OCR
-    # --------------------------------------------------------
-
-    cpu_before = process.cpu_times()
-    cpu_before_seconds = cpu_before.user + cpu_before.system
-
-    # --------------------------------------------------------
-    # OCR timing starts HERE
-    # --------------------------------------------------------
-
-    start_timestamp = utc_timestamp()
-    wall_start = time.perf_counter()
-
-    status = "success"
-    error_message = ""
-    result: dict[str, Any] = {}
+def get_file_size_bytes(
+    file_path: str,
+) -> int:
 
     try:
-        result = perform_ocr(str(pdf_path))
+        return Path(file_path).stat().st_size
 
-    except Exception as exc:
-        status = "failed"
-        error_message = f"{type(exc).__name__}: {exc}"
-
-    wall_end = time.perf_counter()
-    end_timestamp = utc_timestamp()
-
-    # --------------------------------------------------------
-    # OCR timing ends HERE
-    # --------------------------------------------------------
-
-    wall_time_seconds = wall_end - wall_start
-
-    cpu_after = process.cpu_times()
-    cpu_after_seconds = cpu_after.user + cpu_after.system
-
-    cpu_time_seconds = cpu_after_seconds - cpu_before_seconds
-
-    # Number of CPU cores effectively consumed by this process
-    # during the OCR interval.
-    cpu_cores_used = (
-        cpu_time_seconds / wall_time_seconds
-        if wall_time_seconds > 0
-        else 0.0
-    )
-
-    logical_cpu_count = get_logical_cpu_count()
-
-    # Percentage of TOTAL MACHINE logical CPU capacity.
-    cpu_machine_capacity_percent = (
-        cpu_cores_used / logical_cpu_count * 100
-        if logical_cpu_count > 0
-        else 0.0
-    )
-
-    # --------------------------------------------------------
-    # Memory after OCR
-    # --------------------------------------------------------
-
-    ram_after_bytes = process.memory_info().rss
-    ram_after_mb = mb(ram_after_bytes)
-
-    ram_delta_mb = ram_after_mb - ram_before_mb
-
-    # --------------------------------------------------------
-    # Lifetime process peak RSS
-    # --------------------------------------------------------
-
-    try:
-        peak_rss_bytes = resource_peak_rss_bytes()
-        peak_rss_mb = mb(peak_rss_bytes)
-    except Exception:
-        peak_rss_mb = None
-
-    # --------------------------------------------------------
-    # OCR result metrics
-    # --------------------------------------------------------
-
-    confidence = None
-    text_characters = 0
-
-    if status == "success" and isinstance(result, dict):
-        confidence = safe_float(result.get("confidence"))
-
-        extracted_text = result.get("text", "")
-
-        if extracted_text is not None:
-            text_characters = len(str(extracted_text))
-
-    # --------------------------------------------------------
-    # Print result
-    # --------------------------------------------------------
-
-    print(f"OCR wall time       : {wall_time_seconds:.3f} sec")
-    print(f"CPU time            : {cpu_time_seconds:.3f} sec")
-    print(f"CPU cores used      : {cpu_cores_used:.2f}")
-    print(
-        f"CPU machine usage   : "
-        f"{cpu_machine_capacity_percent:.2f}%"
-    )
-    print(f"RAM before          : {ram_before_mb:.2f} MB")
-    print(f"RAM after           : {ram_after_mb:.2f} MB")
-
-    if peak_rss_mb is not None:
-        print(f"Peak RSS            : {peak_rss_mb:.2f} MB")
-
-    if confidence is not None:
-        print(f"Confidence          : {confidence:.4f}")
-
-    print(f"Text characters     : {text_characters}")
-    print(f"Status              : {status}")
-
-    if error_message:
-        print(f"Error               : {error_message}")
-
-    # --------------------------------------------------------
-    # Return one complete CSV-compatible record
-    # --------------------------------------------------------
-
-    return {
-        "document_number": document_number,
-        "filename": pdf_path.name,
-        "file_path": str(pdf_path),
-        "file_type": "application/pdf",
-        "size_bytes": size_bytes,
-        "size_kb": round(size_kb, 3),
-        "size_mb": round(size_mb, 6),
-        "page_count": page_count,
-        "page_count_input": page_count_input,
-        "worker_id": WORKER_ID,
-        "start_timestamp": start_timestamp,
-        "end_timestamp": end_timestamp,
-        "ocr_wall_time_seconds": round(wall_time_seconds, 6),
-        "cpu_process_time_seconds": round(cpu_time_seconds, 6),
-        "cpu_cores_used": round(cpu_cores_used, 6),
-        "cpu_machine_capacity_percent": round(
-            cpu_machine_capacity_percent,
-            6,
-        ),
-        "cpu_avg_percent": round(
-            cpu_machine_capacity_percent,
-            6,
-        ),
-        "logical_cpu_count": logical_cpu_count,
-        "ram_before_mb": round(ram_before_mb, 3),
-        "ram_after_mb": round(ram_after_mb, 3),
-        "peak_rss_mb": (
-            round(peak_rss_mb, 3)
-            if peak_rss_mb is not None
-            else None
-        ),
-        "ram_delta_mb": round(ram_delta_mb, 3),
-        "confidence": (
-            round(confidence, 6)
-            if confidence is not None
-            else None
-        ),
-        "text_characters": text_characters,
-        "status": status,
-        "error": error_message,
-    }
+    except OSError:
+        return 0
 
 
-# ============================================================
-# PEAK RSS
-# ============================================================
-
-def resource_peak_rss_bytes() -> int:
+def get_process_cpu_time() -> float:
     """
-    Return lifetime maximum RSS for this process.
+    Return process CPU time.
 
-    Linux reports ru_maxrss in KB.
+    This includes user + system CPU time used by the
+    benchmark worker process.
     """
-    import resource
 
-    usage = resource.getrusage(resource.RUSAGE_SELF)
+    cpu_times = PROCESS.cpu_times()
 
-    # Linux: KB
-    return int(usage.ru_maxrss * 1024)
+    return (
+        cpu_times.user
+        + cpu_times.system
+    )
 
 
-# ============================================================
-# CSV WRITER
-# ============================================================
+def get_process_rss_mb() -> float:
+    """
+    Return current benchmark worker RSS in MB.
+    """
 
-def write_csv(records: list[dict[str, Any]]) -> None:
-    """Write per-document benchmark results to CSV."""
-
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-
-    fieldnames = [
-        "document_number",
-        "filename",
-        "file_path",
-        "file_type",
-        "size_bytes",
-        "size_kb",
-        "size_mb",
-        "page_count",
-        "page_count_input",
-        "worker_id",
-        "start_timestamp",
-        "end_timestamp",
-        "ocr_wall_time_seconds",
-        "cpu_process_time_seconds",
-        "cpu_cores_used",
-        "cpu_machine_capacity_percent",
-        "cpu_avg_percent",
-        "logical_cpu_count",
-        "ram_before_mb",
-        "ram_after_mb",
-        "peak_rss_mb",
-        "ram_delta_mb",
-        "confidence",
-        "text_characters",
-        "status",
-        "error",
-    ]
-
-    with CSV_PATH.open(
-        "w",
-        newline="",
-        encoding="utf-8",
-    ) as file:
-
-        writer = csv.DictWriter(
-            file,
-            fieldnames=fieldnames,
-        )
-
-        writer.writeheader()
-
-        for record in records:
-            writer.writerow(record)
+    return (
+        PROCESS.memory_info().rss
+        / (1024 * 1024)
+    )
 
 
 # ============================================================
-# SUMMARY
+# PROCESS ONE REDIS JOB
 # ============================================================
 
-def calculate_summary(
-    records: list[dict[str, Any]],
-    model_initialization_seconds: float,
-    benchmark_wall_time_seconds: float,
-    benchmark_start_timestamp: str,
-    benchmark_end_timestamp: str,
+def process_benchmark_message(
+    message_id: str,
+    data: dict[str, str],
 ) -> dict[str, Any]:
 
-    successful = [
-        record
-        for record in records
-        if record["status"] == "success"
-    ]
+    job_id = data["job_id"]
 
-    failed = [
-        record
-        for record in records
-        if record["status"] != "success"
-    ]
+    file_path = data["file_path"]
 
-    # --------------------------------------------------------
-    # Input totals
-    # --------------------------------------------------------
-
-    total_size_bytes = sum(
-        int(record["size_bytes"])
-        for record in records
+    filename = data.get(
+        "filename",
+        Path(file_path).name,
     )
 
-    total_size_mb = mb(total_size_bytes)
+    thread_name = threading.current_thread().name
 
-    total_pages = sum(
-        int(record["page_count"])
-        for record in records
-        if record["page_count"] is not None
+    file_size_bytes = get_file_size_bytes(
+        file_path
     )
 
-    # --------------------------------------------------------
-    # Successful OCR totals
-    # --------------------------------------------------------
-
-    successful_size_bytes = sum(
-        int(record["size_bytes"])
-        for record in successful
+    file_size_mb = (
+        file_size_bytes
+        / (1024 * 1024)
     )
 
-    successful_size_mb = mb(successful_size_bytes)
+    page_count = get_pdf_page_count(
+        file_path
+    ) if Path(file_path).suffix.lower() == ".pdf" else 1
 
-    successful_pages = sum(
-        int(record["page_count"])
-        for record in successful
-        if record["page_count"] is not None
-    )
+    started_at = iso_now()
 
-    total_ocr_wall_time = sum(
-        float(record["ocr_wall_time_seconds"])
-        for record in successful
-    )
+    wall_start = time.perf_counter()
 
-    total_cpu_time = sum(
-        float(record["cpu_process_time_seconds"])
-        for record in successful
-    )
+    cpu_start = get_process_cpu_time()
 
-    # --------------------------------------------------------
-    # Averages
-    # --------------------------------------------------------
+    rss_before_mb = get_process_rss_mb()
 
-    successful_count = len(successful)
+    peak_rss_mb = rss_before_mb
 
-    if successful_count:
-        average_time_per_document = (
-            total_ocr_wall_time / successful_count
-        )
+    status = "completed"
 
-        average_time_per_mb = (
-            total_ocr_wall_time / successful_size_mb
-            if successful_size_mb > 0
-            else 0.0
-        )
-
-        average_time_per_page = (
-            total_ocr_wall_time / successful_pages
-            if successful_pages > 0
-            else 0.0
-        )
-
-        average_cpu_time_seconds = (
-            total_cpu_time / successful_count
-        )
-
-        average_cpu_machine_capacity_percent = (
-            sum(
-                float(
-                    record["cpu_machine_capacity_percent"]
-                )
-                for record in successful
-            )
-            / successful_count
-        )
-
-        average_ram_before_mb = (
-            sum(
-                float(record["ram_before_mb"])
-                for record in successful
-            )
-            / successful_count
-        )
-
-        average_ram_after_mb = (
-            sum(
-                float(record["ram_after_mb"])
-                for record in successful
-            )
-            / successful_count
-        )
-
-        average_ram_delta_mb = (
-            sum(
-                float(record["ram_delta_mb"])
-                for record in successful
-            )
-            / successful_count
-        )
-
-        confidence_values = [
-            float(record["confidence"])
-            for record in successful
-            if record["confidence"] is not None
-        ]
-
-        average_confidence = (
-            sum(confidence_values) / len(confidence_values)
-            if confidence_values
-            else None
-        )
-
-    else:
-        average_time_per_document = 0.0
-        average_time_per_mb = 0.0
-        average_time_per_page = 0.0
-        average_cpu_time_seconds = 0.0
-        average_cpu_machine_capacity_percent = 0.0
-        average_ram_before_mb = 0.0
-        average_ram_after_mb = 0.0
-        average_ram_delta_mb = 0.0
-        average_confidence = None
-
-    # --------------------------------------------------------
-    # Throughput
-    # --------------------------------------------------------
-
-    documents_per_second = (
-        successful_count / benchmark_wall_time_seconds
-        if benchmark_wall_time_seconds > 0
-        else 0.0
-    )
-
-    mb_per_second = (
-        successful_size_mb / benchmark_wall_time_seconds
-        if benchmark_wall_time_seconds > 0
-        else 0.0
-    )
-
-    pages_per_second = (
-        successful_pages / benchmark_wall_time_seconds
-        if benchmark_wall_time_seconds > 0
-        else 0.0
-    )
-
-    gb_per_hour = (
-        mb_per_second * 3600 / 1024
-    )
-
-    # --------------------------------------------------------
-    # Peak RSS
-    # --------------------------------------------------------
-
-    peak_values = [
-        float(record["peak_rss_mb"])
-        for record in successful
-        if record["peak_rss_mb"] is not None
-    ]
-
-    maximum_peak_rss_mb = (
-        max(peak_values)
-        if peak_values
-        else None
-    )
-
-    # --------------------------------------------------------
-    # Summary
-    # --------------------------------------------------------
-
-    return {
-        "benchmark_type": "single_process_sequential_ocr",
-        "worker_count": WORKER_COUNT,
-        "worker_id": WORKER_ID,
-        "logical_cpu_count": get_logical_cpu_count(),
-
-        "pdf_directory": str(PDF_DIR),
-        "results_directory": str(RESULTS_DIR),
-
-        "benchmark_start_timestamp": benchmark_start_timestamp,
-        "benchmark_end_timestamp": benchmark_end_timestamp,
-
-        "documents_requested": len(records),
-        "documents": len(records),
-        "successful": successful_count,
-        "failed": len(failed),
-
-        "success_rate_percent": (
-            successful_count / len(records) * 100
-            if records
-            else 0.0
-        ),
-
-        "total_input_size_mb": total_size_mb,
-        "successful_size_mb": successful_size_mb,
-
-        "total_pages": total_pages,
-        "successful_pages": successful_pages,
-
-        "total_ocr_wall_time_seconds": total_ocr_wall_time,
-        "benchmark_wall_time_seconds": benchmark_wall_time_seconds,
-
-        "model_initialization_seconds": model_initialization_seconds,
-
-        "average_time_per_document_seconds": (
-            average_time_per_document
-        ),
-
-        "average_time_per_mb": average_time_per_mb,
-        "average_time_per_page": average_time_per_page,
-
-        "documents_per_second": documents_per_second,
-        "mb_per_second": mb_per_second,
-        "pages_per_second": pages_per_second,
-        "gb_per_hour": gb_per_hour,
-
-        "total_cpu_time_seconds": total_cpu_time,
-        "average_cpu_time_seconds": average_cpu_time_seconds,
-
-        "average_cpu_machine_capacity_percent": (
-            average_cpu_machine_capacity_percent
-        ),
-
-        # Backward-compatible field name.
-        "average_cpu_percent": (
-            average_cpu_machine_capacity_percent
-        ),
-
-        "average_ram_before_mb": average_ram_before_mb,
-        "average_ram_after_mb": average_ram_after_mb,
-        "average_ram_delta_mb": average_ram_delta_mb,
-
-        "maximum_peak_rss_mb": maximum_peak_rss_mb,
-
-        "average_confidence": average_confidence,
-
-        "measurement_notes": {
-            "ocr_wall_time_excludes_model_initialization": True,
-            "ocr_processing_is_sequential": True,
-            "redis_used": False,
-            "postgres_used": False,
-            "api_used": False,
-            "cpu_machine_capacity_percent_definition": (
-                "Process CPU time divided by OCR wall time, "
-                "normalized by logical CPU count."
-            ),
-            "cpu_cores_used_definition": (
-                "Process CPU seconds divided by OCR wall seconds."
-            ),
-            "peak_rss_definition": (
-                "Lifetime maximum RSS of this Python process "
-                "as reported by Linux getrusage."
-            ),
-        },
-    }
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main() -> None:
+    error_message = ""
 
     print()
-    print("=" * 70)
-    print("OCR SINGLE-WORKER BASELINE BENCHMARK")
-    print("=" * 70)
+    print("=" * 75)
+    print(
+        "BENCHMARK JOB START"
+    )
+    print("=" * 75)
+    print(
+        f"Job ID       : {job_id}"
+    )
+    print(
+        f"Redis ID     : {message_id}"
+    )
+    print(
+        f"Filename     : {filename}"
+    )
+    print(
+        f"File size    : {file_size_mb:.3f} MB"
+    )
+    print(
+        f"Pages        : {page_count}"
+    )
+    print(
+        f"Thread       : {thread_name}"
+    )
+    print(
+        f"Worker       : {BENCHMARK_WORKER_ID}"
+    )
+    print("=" * 75)
 
-    print(f"Project       : {PROJECT_ROOT}")
-    print(f"PDF directory : {PDF_DIR}")
-    print(f"Results       : {RESULTS_DIR}")
-    print(f"Worker        : {WORKER_ID}")
-    print(f"Documents     : {BENCHMARK_LIMIT}")
-    print(f"Logical CPUs  : {get_logical_cpu_count()}")
+    try:
+
+        # ----------------------------------------------------
+        # IMPORTANT
+        # ----------------------------------------------------
+        #
+        # We intentionally reuse the REAL application
+        # process_message().
+        #
+        # process_message() calls:
+        #
+        #     perform_ocr(file_path)
+        #
+        # perform_ocr() gets the single shared PaddleOCR
+        # engine from app.services.ocr_service.
+        #
+        # Therefore this benchmark does NOT create another
+        # OCR engine.
+        # ----------------------------------------------------
+
+        process_message(
+            message_id=message_id,
+            data=data,
+        )
+
+    except Exception as exc:
+
+        status = "failed"
+
+        error_message = str(exc)
+
+        print()
+        print(
+            f"Benchmark job failed: {job_id}"
+        )
+        print(
+            f"Error: {type(exc).__name__}: {exc}"
+        )
+
+        # Use the SAME retry/failure mechanism as the
+        # production worker.
+        try:
+
+            handle_failed_message(
+                message_id=message_id,
+                data=data,
+                exc=exc,
+            )
+
+        except Exception as failure_handler_error:
+
+            print(
+                "Failure handler itself failed: "
+                f"{failure_handler_error}"
+            )
+
+    finally:
+
+        wall_time = (
+            time.perf_counter()
+            - wall_start
+        )
+
+        cpu_time = (
+            get_process_cpu_time()
+            - cpu_start
+        )
+
+        rss_after_mb = get_process_rss_mb()
+
+        peak_rss_mb = max(
+            peak_rss_mb,
+            rss_after_mb,
+        )
+
+        finished_at = iso_now()
+
+        result = {
+            "job_id": job_id,
+            "redis_message_id": message_id,
+            "filename": filename,
+            "file_path": file_path,
+            "file_size_bytes": file_size_bytes,
+            "file_size_mb": round(
+                file_size_mb,
+                4,
+            ),
+            "page_count": page_count,
+            "worker_id": BENCHMARK_WORKER_ID,
+            "thread_name": thread_name,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "wall_time_seconds": round(
+                wall_time,
+                3,
+            ),
+            "cpu_time_seconds": round(
+                cpu_time,
+                3,
+            ),
+            "rss_before_mb": round(
+                rss_before_mb,
+                2,
+            ),
+            "rss_after_mb": round(
+                rss_after_mb,
+                2,
+            ),
+            "peak_rss_mb": round(
+                peak_rss_mb,
+                2,
+            ),
+            "status": status,
+            "error_message": error_message,
+        }
+
+        with RESULTS_LOCK:
+            RESULTS.append(result)
+
+        print()
+        print("=" * 75)
+        print(
+            "BENCHMARK JOB FINISHED"
+        )
+        print("=" * 75)
+        print(
+            f"Job ID       : {job_id}"
+        )
+        print(
+            f"Filename     : {filename}"
+        )
+        print(
+            f"Status       : {status}"
+        )
+        print(
+            f"Thread       : {thread_name}"
+        )
+        print(
+            f"Wall time    : {wall_time:.2f}s"
+        )
+        print(
+            f"CPU time     : {cpu_time:.2f}s"
+        )
+        print(
+            f"RSS before   : {rss_before_mb:.2f} MB"
+        )
+        print(
+            f"RSS after    : {rss_after_mb:.2f} MB"
+        )
+        print(
+            f"Error        : {error_message}"
+        )
+        print("=" * 75)
+
+        return result
+
+
+# ============================================================
+# SAVE RESULTS
+# ============================================================
+
+def write_results() -> None:
 
     RESULTS_DIR.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    # --------------------------------------------------------
-    # Discover documents
-    # --------------------------------------------------------
+    with RESULTS_LOCK:
 
-    pdfs = discover_pdfs()
+        rows = list(RESULTS)
 
-    print()
-    print("Documents selected:")
-
-    for index, pdf_path in enumerate(pdfs, start=1):
-        print(f"  {index:02d}. {pdf_path.name}")
-
-    # --------------------------------------------------------
-    # Initialize model ONCE
-    # --------------------------------------------------------
-
-    model_initialization_seconds = initialize_ocr_engine()
-
-    # --------------------------------------------------------
-    # Start benchmark timing
-    # --------------------------------------------------------
-
-    benchmark_start_timestamp = utc_timestamp()
-    benchmark_start = time.perf_counter()
-
-    records: list[dict[str, Any]] = []
-
-    # --------------------------------------------------------
-    # Sequential processing
-    # --------------------------------------------------------
-
-    for document_number, pdf_path in enumerate(
-        pdfs,
-        start=1,
-    ):
-
-        record = benchmark_document(
-            pdf_path=pdf_path,
-            document_number=document_number,
-        )
-
-        records.append(record)
-
-    # --------------------------------------------------------
-    # Benchmark end
-    # --------------------------------------------------------
-
-    benchmark_end = time.perf_counter()
-    benchmark_end_timestamp = utc_timestamp()
-
-    benchmark_wall_time_seconds = (
-        benchmark_end - benchmark_start
-    )
-
-    # --------------------------------------------------------
-    # Save files
-    # --------------------------------------------------------
-
-    write_csv(records)
-
-    summary = calculate_summary(
-        records=records,
-        model_initialization_seconds=(
-            model_initialization_seconds
-        ),
-        benchmark_wall_time_seconds=(
-            benchmark_wall_time_seconds
-        ),
-        benchmark_start_timestamp=(
-            benchmark_start_timestamp
-        ),
-        benchmark_end_timestamp=(
-            benchmark_end_timestamp
-        ),
-    )
-
-    with SUMMARY_PATH.open(
-        "w",
-        encoding="utf-8",
-    ) as file:
-        json.dump(
-            summary,
-            file,
-            indent=2,
-        )
-
-    benchmark_data = {
-        "summary": summary,
-        "documents": records,
-    }
-
-    with BENCHMARK_PATH.open(
-        "w",
-        encoding="utf-8",
-    ) as file:
-        json.dump(
-            benchmark_data,
-            file,
-            indent=2,
-        )
-
-    # --------------------------------------------------------
-    # Final console summary
-    # --------------------------------------------------------
-
-    print()
-    print("=" * 70)
-    print("BENCHMARK COMPLETE")
-    print("=" * 70)
-
-    print(
-        f"Documents       : "
-        f"{summary['documents']}"
-    )
-
-    print(
-        f"Successful      : "
-        f"{summary['successful']}"
-    )
-
-    print(
-        f"Failed          : "
-        f"{summary['failed']}"
-    )
-
-    print(
-        f"Total input     : "
-        f"{summary['total_input_size_mb']:.3f} MB"
-    )
-
-    print(
-        f"Total pages     : "
-        f"{summary['total_pages']}"
-    )
-
-    print(
-        f"OCR wall time   : "
-        f"{summary['total_ocr_wall_time_seconds']:.3f} sec"
-    )
-
-    print(
-        f"Benchmark time  : "
-        f"{summary['benchmark_wall_time_seconds']:.3f} sec"
-    )
-
-    print(
-        f"Avg/doc         : "
-        f"{summary['average_time_per_document_seconds']:.3f} sec"
-    )
-
-    print(
-        f"Avg/page        : "
-        f"{summary['average_time_per_page']:.3f} sec"
-    )
-
-    print(
-        f"MB/sec          : "
-        f"{summary['mb_per_second']:.6f}"
-    )
-
-    print(
-        f"Pages/sec       : "
-        f"{summary['pages_per_second']:.6f}"
-    )
-
-    print(
-        f"GB/hour         : "
-        f"{summary['gb_per_hour']:.6f}"
-    )
-
-    print(
-        f"CPU time        : "
-        f"{summary['total_cpu_time_seconds']:.3f} sec"
-    )
-
-    print(
-        f"Avg CPU usage   : "
-        f"{summary['average_cpu_machine_capacity_percent']:.2f}% "
-        f"of total machine capacity"
-    )
-
-    if summary["maximum_peak_rss_mb"] is not None:
+    if not rows:
         print(
-            f"Max peak RSS    : "
-            f"{summary['maximum_peak_rss_mb']:.2f} MB"
+            "No benchmark results to write."
+        )
+        return
+
+    fieldnames = [
+        "job_id",
+        "redis_message_id",
+        "filename",
+        "file_path",
+        "file_size_bytes",
+        "file_size_mb",
+        "page_count",
+        "worker_id",
+        "thread_name",
+        "started_at",
+        "finished_at",
+        "wall_time_seconds",
+        "cpu_time_seconds",
+        "rss_before_mb",
+        "rss_after_mb",
+        "peak_rss_mb",
+        "status",
+        "error_message",
+    ]
+
+    with CSV_FILE.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as csv_file:
+
+        writer = csv.DictWriter(
+            csv_file,
+            fieldnames=fieldnames,
         )
 
-    if summary["average_confidence"] is not None:
+        writer.writeheader()
+
+        for row in sorted(
+            rows,
+            key=lambda item: item["filename"],
+        ):
+            writer.writerow(row)
+
+    print()
+    print(
+        f"Benchmark CSV written to: {CSV_FILE}"
+    )
+
+
+# ============================================================
+# SUMMARY
+# ============================================================
+
+def print_summary() -> None:
+
+    with RESULTS_LOCK:
+        rows = list(RESULTS)
+
+    if not rows:
+        return
+
+    completed = [
+        row
+        for row in rows
+        if row["status"] == "completed"
+    ]
+
+    failed = [
+        row
+        for row in rows
+        if row["status"] == "failed"
+    ]
+
+    total_mb = sum(
+        row["file_size_mb"]
+        for row in rows
+    )
+
+    total_wall = sum(
+        row["wall_time_seconds"]
+        for row in rows
+    )
+
+    average_wall = (
+        total_wall / len(rows)
+        if rows
+        else 0.0
+    )
+
+    max_peak_rss = max(
+        row["peak_rss_mb"]
+        for row in rows
+    )
+
+    print()
+    print()
+    print("=" * 75)
+    print("BENCHMARK SUMMARY")
+    print("=" * 75)
+
+    print(
+        f"Worker                    : "
+        f"{BENCHMARK_WORKER_ID}"
+    )
+
+    print(
+        f"Executor slots            : "
+        f"{CONCURRENCY}"
+    )
+
+    print(
+        f"PaddleOCR engines        : 1"
+    )
+
+    print(
+        f"Total jobs processed      : "
+        f"{len(rows)}"
+    )
+
+    print(
+        f"Completed                 : "
+        f"{len(completed)}"
+    )
+
+    print(
+        f"Failed                    : "
+        f"{len(failed)}"
+    )
+
+    print(
+        f"Total PDF data            : "
+        f"{total_mb:.3f} MB"
+    )
+
+    print(
+        f"Average job wall time     : "
+        f"{average_wall:.2f}s"
+    )
+
+    print(
+        f"Peak benchmark RSS        : "
+        f"{max_peak_rss:.2f} MB"
+    )
+
+    print(
+        f"Results CSV               : "
+        f"{CSV_FILE}"
+    )
+
+    print("=" * 75)
+
+
+# ============================================================
+# MAIN REDIS WORKER
+# ============================================================
+
+def main() -> None:
+
+    print()
+    print("=" * 75)
+    print("OCR BENCHMARK WORKER")
+    print("=" * 75)
+    print(
+        f"Worker ID             : {BENCHMARK_WORKER_ID}"
+    )
+    print(
+        f"Redis stream          : {OCR_STREAM_NAME}"
+    )
+    print(
+        f"Redis consumer group  : {OCR_CONSUMER_GROUP}"
+    )
+    print(
+        f"Executor slots        : {CONCURRENCY}"
+    )
+    print(
+        f"PaddleOCR engines     : 1"
+    )
+    print(
+        f"Redis block           : {REDIS_BLOCK_MS} ms"
+    )
+    print("=" * 75)
+
+    # --------------------------------------------------------
+    # Signal handling
+    # --------------------------------------------------------
+
+    signal.signal(
+        signal.SIGINT,
+        handle_shutdown_signal,
+    )
+
+    signal.signal(
+        signal.SIGTERM,
+        handle_shutdown_signal,
+    )
+
+    # --------------------------------------------------------
+    # PostgreSQL
+    # --------------------------------------------------------
+
+    initialize_connection_pool()
+
+    executor = ThreadPoolExecutor(
+        max_workers=CONCURRENCY,
+        thread_name_prefix="benchmark-ocr",
+    )
+
+    active_futures: dict[
+        Future,
+        tuple[str, dict[str, str]],
+    ] = {}
+
+    try:
+
+        # ----------------------------------------------------
+        # Redis consumer group
+        # ----------------------------------------------------
+
+        create_consumer_group()
+
+        print()
         print(
-            f"Avg confidence  : "
-            f"{summary['average_confidence']:.4f}"
+            "Benchmark worker is waiting for Redis jobs..."
         )
 
-    print()
-    print("Output files:")
-    print(f"  {CSV_PATH}")
-    print(f"  {SUMMARY_PATH}")
-    print(f"  {BENCHMARK_PATH}")
-    print()
+        # ----------------------------------------------------
+        # IMPORTANT:
+        #
+        # We DO NOT call:
+        #
+        #     recover_pending_messages()
+        #
+        # here.
+        #
+        # This benchmark should process only NEW jobs created
+        # by the current 10-user Locust test.
+        #
+        # We don't want the benchmark worker to unexpectedly
+        # take old production jobs.
+        # ----------------------------------------------------
+
+        while not STOP_EVENT.is_set():
+
+            # ------------------------------------------------
+            # Remove completed futures
+            # ------------------------------------------------
+
+            completed_futures = [
+                future
+                for future in active_futures
+                if future.done()
+            ]
+
+            for future in completed_futures:
+
+                message_id, data = active_futures.pop(
+                    future
+                )
+
+                try:
+                    future.result()
+
+                except Exception as exc:
+
+                    print(
+                        "Unexpected benchmark future error: "
+                        f"{exc}"
+                    )
+
+            # ------------------------------------------------
+            # Determine available worker slots
+            # ------------------------------------------------
+
+            available_slots = (
+                CONCURRENCY
+                - len(active_futures)
+            )
+
+            if available_slots <= 0:
+
+                done, _ = wait(
+                    active_futures,
+                    return_when=FIRST_COMPLETED,
+                )
+
+                for future in done:
+
+                    message_id, data = active_futures.pop(
+                        future
+                    )
+
+                    try:
+                        future.result()
+
+                    except Exception as exc:
+
+                        print(
+                            "Benchmark future error: "
+                            f"{exc}"
+                        )
+
+                continue
+
+            # ------------------------------------------------
+            # Read NEW Redis jobs
+            # ------------------------------------------------
+
+            response = redis_client.xreadgroup(
+                groupname=OCR_CONSUMER_GROUP,
+                consumername=BENCHMARK_WORKER_ID,
+                streams={
+                    OCR_STREAM_NAME: ">"
+                },
+                count=available_slots,
+                block=REDIS_BLOCK_MS,
+            )
+
+            if not response:
+                continue
+
+            # ------------------------------------------------
+            # Submit jobs to ThreadPoolExecutor
+            # ------------------------------------------------
+
+            for stream_name, messages in response:
+
+                for message_id, data in messages:
+
+                    if (
+                        len(active_futures)
+                        >= CONCURRENCY
+                    ):
+                        break
+
+                    future = executor.submit(
+                        process_benchmark_message,
+                        message_id,
+                        data,
+                    )
+
+                    active_futures[future] = (
+                        message_id,
+                        data,
+                    )
+
+                    print(
+                        f"Redis job received: "
+                        f"{message_id}"
+                    )
+
+                    print(
+                        f"Active OCR slots: "
+                        f"{len(active_futures)}/"
+                        f"{CONCURRENCY}"
+                    )
+
+    finally:
+
+        print()
+        print(
+            "Stopping benchmark worker..."
+        )
+
+        # ----------------------------------------------------
+        # Wait for active OCR jobs.
+        # ----------------------------------------------------
+
+        if active_futures:
+
+            print(
+                f"Waiting for "
+                f"{len(active_futures)} active OCR job(s)..."
+            )
+
+            wait(
+                active_futures,
+            )
+
+            for future in list(
+                active_futures
+            ):
+
+                try:
+                    future.result()
+
+                except Exception as exc:
+
+                    print(
+                        f"Active job error: {exc}"
+                    )
+
+        executor.shutdown(
+            wait=True
+        )
+
+        write_results()
+
+        print_summary()
+
+        close_connection_pool()
+
+        print(
+            "Benchmark worker stopped."
+        )
 
 
 if __name__ == "__main__":

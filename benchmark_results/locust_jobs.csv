@@ -1,0 +1,4 @@
+timestamp_utc,file,pages,size_kb,job_id,status,end_to_end_seconds,queue_wait_seconds,processing_seconds,attempts,error
+2026-10-01T07:40:46+00:00,ocr_test_04.pdf,4,71.7,6e8f209c-9508-437f-aae0-839d61bf5dfc,done,617.16,0.02,611.56,1,
+2026-10-01T07:40:58+00:00,ocr_test_03.pdf,4,866.8,b802c1d1-5c11-4a8f-ba3a-d61b7fde8e01,done,630.17,0.02,629.6,1,
+2026-10-01T07:41:03+00:00,ocr_test_03.pdf,4,866.8,52349daa-b3cb-4376-a80f-9b622f9834e7,done,633.14,0.07,632.09,1,

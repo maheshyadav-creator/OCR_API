@@ -1,3 +1,13 @@
+ source /home/mahesh/Documents/OCR_API/venv/bin/activate
+ source /home/mahesh/Documents/OCR_API/venv/bin/activate
+ source /home/mahesh/Documents/OCR_API/venv/bin/activate
+ source /home/mahesh/Documents/OCR_API/venv/bin/activate
+ source /home/mahesh/Documents/OCR_API/venv/bin/activate
+ source /home/mahesh/Documents/OCR_API/venv/bin/activate
+ source /home/mahesh/Documents/OCR_API/venv/bin/activate
+ source /home/mahesh/Documents/OCR_API/venv/bin/activate
+ source /home/mahesh/Documents/OCR_API/venv/bin/activate
+ source /home/mahesh/Documents/OCR_API/venv/bin/activate
 from __future__ import annotations
 
 import csv
@@ -18,8 +28,12 @@ from typing import Any
 import fitz
 import numpy as np
 import psutil
-from paddleocr import PaddleOCR
 from pypdf import PdfReader
+
+from app.services.ocr_service import (
+    OCR_ENGINE_LOCK,
+    get_ocr_engine,
+)
 
 
 # ============================================================
@@ -36,11 +50,6 @@ RESULTS_DIR = (
     PROJECT_ROOT / "benchmark_results"
 )
 
-
-# ============================================================
-# BENCHMARK LIMIT
-# ============================================================
-
 BENCHMARK_LIMIT = int(
     os.getenv(
         "BENCHMARK_LIMIT",
@@ -48,22 +57,20 @@ BENCHMARK_LIMIT = int(
     )
 )
 
-
-# ============================================================
+# ------------------------------------------------------------
 # CONCURRENCY
-# ============================================================
+# ------------------------------------------------------------
 
 CONCURRENCY = int(
     os.getenv(
         "BENCHMARK_CONCURRENCY",
-        "1",
+        "2",
     )
 )
 
-
-# ============================================================
+# ------------------------------------------------------------
 # RETRY CONFIGURATION
-# ============================================================
+# ------------------------------------------------------------
 
 MAX_RETRIES = int(
     os.getenv(
@@ -79,10 +86,9 @@ RETRY_DELAY_SECONDS = float(
     )
 )
 
-
-# ============================================================
-# PADDLEOCR CONFIGURATION
-# ============================================================
+# ------------------------------------------------------------
+# PaddleOCR CPU configuration
+# ------------------------------------------------------------
 
 OCR_LANG = os.getenv(
     "OCR_LANG",
@@ -101,45 +107,9 @@ OCR_CPU_THREADS = int(
     )
 )
 
-
-# ============================================================
-# MEMORY-SAFE PADDLEOCR CONFIGURATION
-# ============================================================
-#
-# IMPORTANT:
-#
-# This benchmark intentionally uses ONLY the normal OCR
-# detection + recognition pipeline.
-#
-# The following optional/heavier pipelines are disabled:
-#
-#   1. Document orientation classification
-#   2. Document unwarping
-#   3. Textline orientation classification
-#
-# Therefore the benchmark should initialize only:
-#
-#   PP-OCRv6_medium_det
-#   PP-OCRv6_medium_rec
-#
-# DO NOT enable the three optional pipelines here unless
-# memory requirements have been measured and approved.
-#
-# The machine has approximately 7.5 GiB RAM and no swap.
-# ============================================================
-
-USE_DOC_ORIENTATION_CLASSIFY = False
-
-USE_DOC_UNWARPING = False
-
-USE_TEXTLINE_ORIENTATION = False
-
-ENABLE_MKLDNN = False
-
-
-# ============================================================
-# PDF RENDERING
-# ============================================================
+# ------------------------------------------------------------
+# PDF rendering configuration
+# ------------------------------------------------------------
 
 PDF_DPI = int(
     os.getenv(
@@ -148,22 +118,17 @@ PDF_DPI = int(
     )
 )
 
-OCR_DET_LIMIT = int(os.getenv("OCR_DET_LIMIT_SIDE_LEN", "960"))
-OCR_REC_BATCH_SIZE = int(os.getenv("OCR_REC_BATCH_SIZE", "2"))
-
-
-# ============================================================
-# BENCHMARK IDENTITY
-# ============================================================
+# ------------------------------------------------------------
+# Benchmark identity
+# ------------------------------------------------------------
 
 WORKER_ID = "single_worker"
 
 WORKER_COUNT = 1
 
-
-# ============================================================
-# OUTPUT FILES
-# ============================================================
+# ------------------------------------------------------------
+# Output files
+# ------------------------------------------------------------
 
 CSV_PATH = (
     RESULTS_DIR / "per_document.csv"
@@ -176,282 +141,6 @@ SUMMARY_PATH = (
 BENCHMARK_PATH = (
     RESULTS_DIR / "benchmark.json"
 )
-
-
-# ============================================================
-# SHARED BENCHMARK OCR ENGINE
-# ============================================================
-#
-# IMPORTANT:
-#
-# There is exactly ONE PaddleOCR object in this benchmark
-# Python process.
-#
-# It is NOT thread-local.
-#
-# It is NOT created inside benchmark_document().
-#
-# It is NOT created inside run_ocr().
-#
-# It is created once by initialize_shared_ocr_engine()
-# BEFORE ThreadPoolExecutor starts.
-#
-# All 100 PDFs reuse this same object.
-# ============================================================
-
-_SHARED_OCR_ENGINE: PaddleOCR | None = None
-
-OCR_ENGINE_LOCK = threading.Lock()
-
-_ENGINE_INITIALIZATION_LOCK = threading.Lock()
-
-
-def initialize_shared_ocr_engine() -> PaddleOCR:
-    """
-    Create the benchmark PaddleOCR engine exactly once.
-
-    The engine is shared by every benchmark thread and every
-    benchmark document in this Python process.
-
-    Only the normal OCR detection + recognition models are
-    enabled.
-
-    Disabled models/pipelines:
-
-        use_doc_orientation_classify=False
-        use_doc_unwarping=False
-        use_textline_orientation=False
-
-    Expected models:
-
-        PP-OCRv6_medium_det
-        PP-OCRv6_medium_rec
-
-    Returns:
-        The single shared PaddleOCR engine.
-    """
-
-    global _SHARED_OCR_ENGINE
-
-    # --------------------------------------------------------
-    # Fast path:
-    #
-    # If the engine already exists, simply return it.
-    # --------------------------------------------------------
-
-    if _SHARED_OCR_ENGINE is not None:
-
-        return _SHARED_OCR_ENGINE
-
-    # --------------------------------------------------------
-    # Protect initialization.
-    #
-    # Normally initialization happens before threads start,
-    # but this lock makes the function safe if it is called
-    # again later.
-    # --------------------------------------------------------
-
-    with _ENGINE_INITIALIZATION_LOCK:
-
-        if _SHARED_OCR_ENGINE is not None:
-
-            return _SHARED_OCR_ENGINE
-
-        print()
-        print(
-            "=" * 70
-        )
-
-        print(
-            "INITIALIZING LIGHTWEIGHT "
-            "SHARED PADDLEOCR ENGINE"
-        )
-
-        print(
-            "=" * 70
-        )
-
-        print(
-            "Engine ownership       : "
-            "ONE shared engine"
-        )
-
-        print(
-            "Initialization         : "
-            "ONCE per benchmark process"
-        )
-
-        print(
-            "OCR language           : "
-            f"{OCR_LANG}"
-        )
-
-        print(
-            "OCR device             : "
-            f"{OCR_DEVICE}"
-        )
-
-        print(
-            "OCR CPU threads        : "
-            f"{OCR_CPU_THREADS}"
-        )
-        print("Detection limit        : " f"{OCR_DET_LIMIT}px")
-
-        print("Recognition batch size : "f"{OCR_REC_BATCH_SIZE}")
-        print(
-            "Document orientation   : "
-            "DISABLED"
-        )
-
-        print(
-            "Document unwarping     : "
-            "DISABLED"
-        )
-
-        print(
-            "Textline orientation   : "
-            "DISABLED"
-        )
-
-        print(
-            "MKL-DNN                : "
-            "False"
-        )
-
-        print()
-        print(
-            "Models expected:"
-        )
-
-        print(
-            "  - PP-OCRv6_medium_det"
-        )
-
-        print(
-            "  - PP-OCRv6_medium_rec"
-        )
-
-        print()
-        print(
-            "WARNING:"
-        )
-
-        print(
-            "Benchmark intentionally does NOT load "
-            "document orientation, unwarping, or "
-            "textline orientation models."
-        )
-
-        print(
-            "=" * 70
-        )
-
-        # ----------------------------------------------------
-        # CREATE THE ONLY PADDLEOCR INSTANCE
-        # ----------------------------------------------------
-        #
-        # These three False settings are the critical part.
-        #
-        # They prevent PaddleOCR from creating:
-        #
-        #   PP-LCNet_x1_0_doc_ori
-        #   UVDoc
-        #   PP-LCNet_x1_0_textline_ori
-        #
-        # Only detection + recognition remain.
-        # ----------------------------------------------------
-
-        _SHARED_OCR_ENGINE = PaddleOCR(
-             lang=OCR_LANG,
-             device=OCR_DEVICE,
-
-             use_doc_orientation_classify=(
-               USE_DOC_ORIENTATION_CLASSIFY
-              ),
-
-             use_doc_unwarping=(
-              USE_DOC_UNWARPING
-             ),
-
-             use_textline_orientation=(
-               USE_TEXTLINE_ORIENTATION
-             ),
-
-             enable_mkldnn=ENABLE_MKLDNN,
-
-             cpu_threads=OCR_CPU_THREADS,
-
-             text_det_limit_type="max",
-
-             text_det_limit_side_len=OCR_DET_LIMIT,
-
-             text_recognition_batch_size=OCR_REC_BATCH_SIZE,)
-
-        print()
-        print(
-            "=" * 70
-        )
-
-        print(
-            "SHARED LIGHTWEIGHT PADDLEOCR "
-            "ENGINE INITIALIZED"
-        )
-
-        print(
-            "=" * 70
-        )
-
-        print(
-            "Engine instances : 1"
-        )
-
-        print(
-            "Models           : detection + recognition only"
-        )
-
-        print(
-            "Orientation      : disabled"
-        )
-
-        print(
-            "Unwarping        : disabled"
-        )
-
-        print(
-            "Textline ori     : disabled"
-        )
-
-        print(
-            "The SAME engine will be reused for "
-            "all benchmark PDFs."
-        )
-
-        print(
-            "=" * 70
-        )
-
-    return _SHARED_OCR_ENGINE
-
-
-def get_shared_ocr_engine() -> PaddleOCR:
-    """
-    Return the single benchmark PaddleOCR engine.
-
-    The engine must already have been initialized before
-    concurrent processing starts.
-
-    This function NEVER creates a new engine.
-    """
-
-    if _SHARED_OCR_ENGINE is None:
-
-        raise RuntimeError(
-            "Shared PaddleOCR engine has not been initialized. "
-            "Call initialize_shared_ocr_engine() before "
-            "starting the benchmark."
-        )
-
-    return _SHARED_OCR_ENGINE
 
 
 # ============================================================
@@ -577,14 +266,11 @@ def safe_float(
 ) -> float | None:
 
     if value is None:
-
         return None
 
     try:
 
-        return float(
-            value
-        )
+        return float(value)
 
     except (
         TypeError,
@@ -600,7 +286,8 @@ def safe_float(
 
 def resource_peak_rss_bytes() -> int:
     """
-    Return lifetime maximum RSS for this Python process.
+    Return lifetime maximum RSS
+    for this Python process.
 
     Linux reports ru_maxrss in KB.
     """
@@ -627,42 +314,11 @@ def extract_page_result(
     list[float],
 ]:
     """
-    Extract OCR text and confidence values from one
-    PaddleOCR result.
+    Extract OCR text and confidence
+    values from one PaddleOCR result.
     """
 
-    try:
-
-        result_data = result.json
-
-    except Exception:
-
-        result_data = {}
-
-    if callable(result_data):
-
-        try:
-
-            result_data = result_data()
-
-        except Exception:
-
-            result_data = {}
-
-    if isinstance(
-        result_data,
-        str,
-    ):
-
-        try:
-
-            result_data = json.loads(
-                result_data
-            )
-
-        except json.JSONDecodeError:
-
-            result_data = {}
+    result_data = result.json
 
     if not isinstance(
         result_data,
@@ -711,7 +367,6 @@ def extract_page_result(
         ).strip()
 
         if not text:
-
             continue
 
         try:
@@ -757,7 +412,7 @@ def extract_page_result(
 # ============================================================
 
 def ocr_numpy_image(
-    ocr: PaddleOCR,
+    ocr: Any,
     image: np.ndarray,
     page_number: int,
 ) -> tuple[
@@ -768,16 +423,18 @@ def ocr_numpy_image(
     """
     Run PaddleOCR on one rendered PDF page.
 
+    The image is supplied as a NumPy array.
+
     IMPORTANT:
+        The PaddleOCR engine is shared by all
+        benchmark threads.
 
-    The benchmark has exactly ONE PaddleOCR engine.
+        OCR_ENGINE_LOCK ensures that only one
+        thread calls ocr.predict() at a time.
 
-    Multiple benchmark threads may render PDF pages, but
-    only one thread at a time is allowed to execute
-    ocr.predict() on the shared engine.
-
-    This prevents concurrent access to the same PaddleOCR
-    engine and avoids creating multiple model instances.
+    This prevents multiple PaddleOCR inference
+    operations from simultaneously using the
+    same engine on the constrained machine.
     """
 
     with OCR_ENGINE_LOCK:
@@ -786,22 +443,12 @@ def ocr_numpy_image(
             image
         )
 
-    try:
+    for result in results:
 
-        for result in results:
-
-            return extract_page_result(
-                result,
-                page_number,
-            )
-
-    finally:
-
-        # Release the local results reference after extracting
-        # the required page data.
-        results = None
-
-        gc.collect()
+        return extract_page_result(
+            result,
+            page_number,
+        )
 
     return (
         {
@@ -820,7 +467,7 @@ def ocr_numpy_image(
 
 def run_pdf_ocr(
     pdf_path: Path,
-    ocr: PaddleOCR,
+    ocr: Any,
 ) -> dict[str, Any]:
     """
     OCR a PDF one page at a time.
@@ -831,42 +478,37 @@ def run_pdf_ocr(
           ↓
         PyMuPDF
           ↓
-        Render ONE page
+        Render one page
           ↓
         NumPy image
           ↓
-        SAME shared PaddleOCR engine
+        Shared PaddleOCR engine
           ↓
         OCR_ENGINE_LOCK
           ↓
-        OCR inference
+        PaddleOCR inference
           ↓
         Release page memory
           ↓
         Next page
 
-    The PaddleOCR engine is NEVER recreated between pages
-    or documents.
+    The same PaddleOCR engine is reused
+    for every page and every PDF in this
+    benchmark process.
     """
 
     pages: list[
         dict[str, Any]
     ] = []
 
-    all_text: list[
-        str
-    ] = []
+    all_text: list[str] = []
 
     confidence_values: list[
         float
     ] = []
 
-    thread_name = (
-        threading.current_thread().name
-    )
-
     print(
-        f"[{thread_name}] "
+        f"[{threading.current_thread().name}] "
         f"Opening PDF with PyMuPDF: "
         f"{pdf_path.name}"
     )
@@ -882,7 +524,7 @@ def run_pdf_ocr(
         )
 
         print(
-            f"[{thread_name}] "
+            f"[{threading.current_thread().name}] "
             f"PDF opened: "
             f"{pdf_path.name} "
             f"({page_count} pages, "
@@ -890,7 +532,9 @@ def run_pdf_ocr(
         )
 
         # ----------------------------------------------------
-        # PDF default resolution = 72 DPI.
+        # Convert DPI to PDF zoom.
+        #
+        # PDF default resolution is 72 DPI.
         # ----------------------------------------------------
 
         zoom = (
@@ -915,7 +559,7 @@ def run_pdf_ocr(
             )
 
             print(
-                f"[{thread_name}] "
+                f"[{threading.current_thread().name}] "
                 f"[PDF] Processing "
                 f"{pdf_path.name} "
                 f"page "
@@ -938,7 +582,7 @@ def run_pdf_ocr(
                 )
 
                 # ------------------------------------------------
-                # Render page.
+                # Render page into RGB pixels.
                 # ------------------------------------------------
 
                 pixmap = page.get_pixmap(
@@ -948,7 +592,7 @@ def run_pdf_ocr(
                 )
 
                 print(
-                    f"[{thread_name}] "
+                    f"[{threading.current_thread().name}] "
                     f"[PDF] Page "
                     f"{page_number}: "
                     f"{pixmap.width}x"
@@ -956,7 +600,7 @@ def run_pdf_ocr(
                 )
 
                 # ------------------------------------------------
-                # Convert PyMuPDF pixels to NumPy.
+                # Convert rendered pixels to NumPy.
                 # ------------------------------------------------
 
                 image_array = np.frombuffer(
@@ -973,7 +617,7 @@ def run_pdf_ocr(
                 )
 
                 # ------------------------------------------------
-                # OCR using the SAME shared engine.
+                # Run OCR on this single page.
                 # ------------------------------------------------
 
                 (
@@ -1001,7 +645,7 @@ def run_pdf_ocr(
                 )
 
                 print(
-                    f"[{thread_name}] "
+                    f"[{threading.current_thread().name}] "
                     f"[PDF] Completed "
                     f"{pdf_path.name} "
                     f"page "
@@ -1012,13 +656,15 @@ def run_pdf_ocr(
             finally:
 
                 # ------------------------------------------------
-                # Release page-level objects.
+                # Release page-level Python references.
+                #
+                # gc.collect() does NOT guarantee that Paddle/Paddle
+                # native memory is returned to the OS, but it helps
+                # release Python-side objects between pages.
                 # ------------------------------------------------
 
                 image_array = None
-
                 pixmap = None
-
                 page = None
 
                 gc.collect()
@@ -1030,7 +676,7 @@ def run_pdf_ocr(
         gc.collect()
 
     # ========================================================
-    # FINAL PDF RESULT
+    # Final PDF result
     # ========================================================
 
     extracted_text = "\n\n".join(
@@ -1062,32 +708,37 @@ def run_pdf_ocr(
 
 
 # ============================================================
-# OCR ENTRY POINT
+# OCR RESULT
 # ============================================================
 
 def run_ocr(
     pdf_path: Path,
 ) -> dict[str, Any]:
     """
-    Run OCR using the ONE benchmark PaddleOCR engine.
+    Run OCR using ONE shared PaddleOCR engine.
 
-    This function does NOT create PaddleOCR.
+    The engine comes from the application's
+    cached get_ocr_engine() function.
 
-    It retrieves the already initialized process-wide
-    benchmark engine.
+    Because all benchmark threads execute
+    inside the same Python process, the cached
+    engine is shared by all threads.
 
-    PDFs are processed page-by-page using PyMuPDF + NumPy.
+    PDFs are processed page-by-page using
+    PyMuPDF + NumPy.
     """
 
     # --------------------------------------------------------
-    # IMPORTANT:
+    # Get the shared cached PaddleOCR engine.
     #
-    # This only retrieves the existing engine.
+    # get_ocr_engine() uses @lru_cache(maxsize=1)
+    # in app.services.ocr_service.
     #
-    # It NEVER creates another PaddleOCR instance.
+    # Therefore this Python process has one
+    # PaddleOCR engine instance.
     # --------------------------------------------------------
 
-    ocr = get_shared_ocr_engine()
+    ocr = get_ocr_engine()
 
     thread_name = (
         threading.current_thread().name
@@ -1111,7 +762,10 @@ def run_ocr(
         )
 
     # --------------------------------------------------------
-    # Non-PDF fallback.
+    # Non-PDF fallback
+    #
+    # Benchmark currently uses PDFs, but this keeps the
+    # function usable for an image file if needed later.
     # --------------------------------------------------------
 
     with OCR_ENGINE_LOCK:
@@ -1124,49 +778,39 @@ def run_ocr(
         dict[str, Any]
     ] = []
 
-    all_text: list[
-        str
-    ] = []
+    all_text: list[str] = []
 
     confidence_values: list[
         float
     ] = []
 
-    try:
+    for page_number, result in enumerate(
+        results,
+        start=1,
+    ):
 
-        for page_number, result in enumerate(
-            results,
-            start=1,
-        ):
+        (
+            page_data,
+            page_text,
+            page_confidences,
+        ) = extract_page_result(
+            result,
+            page_number,
+        )
 
-            (
-                page_data,
-                page_text,
-                page_confidences,
-            ) = extract_page_result(
-                result,
-                page_number,
+        pages.append(
+            page_data
+        )
+
+        if page_text:
+
+            all_text.append(
+                page_text
             )
 
-            pages.append(
-                page_data
-            )
-
-            if page_text:
-
-                all_text.append(
-                    page_text
-                )
-
-            confidence_values.extend(
-                page_confidences
-            )
-
-    finally:
-
-        results = None
-
-        gc.collect()
+        confidence_values.extend(
+            page_confidences
+        )
 
     extracted_text = "\n\n".join(
         all_text
@@ -1207,13 +851,14 @@ def benchmark_document(
     """
     Process one PDF.
 
-    The function executes inside one benchmark slot.
+    The function is executed by one of the
+    concurrent benchmark slots.
 
     IMPORTANT:
+        The benchmark slots do NOT create their
+        own PaddleOCR engines.
 
-    Benchmark slots DO NOT create PaddleOCR engines.
-
-    Every slot uses the SAME process-wide engine.
+        All slots use the same shared engine.
     """
 
     process = get_process()
@@ -1260,47 +905,30 @@ def benchmark_document(
     print(
         "=" * 70
     )
-
     print(
         f"START DOCUMENT {document_number}"
     )
-
     print(
-        f"File          : "
-        f"{pdf_path.name}"
+        f"File          : {pdf_path.name}"
     )
-
     print(
-        f"Size          : "
-        f"{size_mb:.3f} MB"
+        f"Size          : {size_mb:.3f} MB"
     )
-
     print(
-        f"Pages         : "
-        f"{page_count}"
+        f"Pages         : {page_count}"
     )
-
     print(
-        f"Worker        : "
-        f"{WORKER_ID}"
+        f"Worker        : {WORKER_ID}"
     )
-
     print(
-        f"Thread        : "
-        f"{thread_name}"
+        f"Thread        : {thread_name}"
     )
-
-    print(
-        f"PaddleOCR     : "
-        f"ONE shared engine"
-    )
-
     print(
         "=" * 70
     )
 
     # --------------------------------------------------------
-    # Retry state
+    # Retry loop
     # --------------------------------------------------------
 
     final_status = "failed"
@@ -1649,11 +1277,7 @@ def benchmark_document(
 
             retry_delay = (
                 RETRY_DELAY_SECONDS
-                * (
-                    2 ** (
-                        attempt - 1
-                    )
-                )
+                * (2 ** (attempt - 1))
             )
 
             print(
@@ -1673,7 +1297,7 @@ def benchmark_document(
             )
 
     # ========================================================
-    # FINAL DOCUMENT METRICS
+    # Final document metrics
     # ========================================================
 
     confidence = None
@@ -1710,7 +1334,7 @@ def benchmark_document(
             )
 
     # --------------------------------------------------------
-    # Average metrics
+    # Average metrics across attempts
     # --------------------------------------------------------
 
     average_attempt_wall_time = (
@@ -1738,7 +1362,7 @@ def benchmark_document(
     )
 
     # ========================================================
-    # FINAL RECORD
+    # Final record
     # ========================================================
 
     return {
@@ -1748,12 +1372,10 @@ def benchmark_document(
         "file_type": "application/pdf",
 
         "size_bytes": size_bytes,
-
         "size_kb": round(
             size_kb,
             3,
         ),
-
         "size_mb": round(
             size_mb,
             6,
@@ -1762,29 +1384,21 @@ def benchmark_document(
         "page_count": page_count,
 
         "worker_id": WORKER_ID,
-
         "worker_count": WORKER_COUNT,
 
         "thread_name": thread_name,
-
         "thread_id": thread.ident,
 
         "concurrency_limit": CONCURRENCY,
 
         "pdf_dpi": PDF_DPI,
 
-        "ocr_detection_limit_side_len": OCR_DET_LIMIT,
-
-        "ocr_recognition_batch_size": OCR_REC_BATCH_SIZE,
-
         "ocr_cpu_threads": OCR_CPU_THREADS,
 
         "attempts": total_attempts,
-
         "successful_attempt": (
             successful_attempt
         ),
-
         "retry_count": (
             max(
                 total_attempts - 1,
@@ -1795,7 +1409,6 @@ def benchmark_document(
         "start_timestamp": (
             first_start_timestamp
         ),
-
         "end_timestamp": (
             final_end_timestamp
         ),
@@ -1876,28 +1489,6 @@ def benchmark_document(
         "status": final_status,
 
         "error": final_error,
-
-        # ----------------------------------------------------
-        # Explicit engine information.
-        # ----------------------------------------------------
-
-        "paddleocr_engine_instances": 1,
-
-        "paddleocr_engine_scope": (
-            "one benchmark Python process"
-        ),
-
-        "paddleocr_orientation_models": (
-            False
-        ),
-
-        "paddleocr_unwarping_model": (
-            False
-        ),
-
-        "paddleocr_textline_orientation": (
-            False
-        ),
     }
 
 
@@ -1917,7 +1508,6 @@ def write_csv(
     )
 
     if not records:
-
         return
 
     fieldnames = list(
@@ -2165,19 +1755,12 @@ def calculate_summary(
     else:
 
         average_time_per_document = 0.0
-
         average_time_per_page = 0.0
-
         average_cpu_time = 0.0
-
         average_cpu_usage = 0.0
-
         average_ram_before = 0.0
-
         average_ram_after = 0.0
-
         average_peak_rss = 0.0
-
         average_confidence = None
 
     # --------------------------------------------------------
@@ -2228,9 +1811,7 @@ def calculate_summary(
     ]
 
     maximum_peak_rss_mb = (
-        max(
-            peak_values
-        )
+        max(peak_values)
         if peak_values
         else None
     )
@@ -2255,10 +1836,6 @@ def calculate_summary(
         ),
 
         "pdf_dpi": PDF_DPI,
-
-        "ocr_detection_limit_side_len": OCR_DET_LIMIT,
-
-        "ocr_recognition_batch_size": OCR_REC_BATCH_SIZE,
 
         "max_retries": MAX_RETRIES,
 
@@ -2394,43 +1971,6 @@ def calculate_summary(
             average_confidence
         ),
 
-        # ====================================================
-        # PADDLEOCR ENGINE INFORMATION
-        # ====================================================
-
-        "paddleocr_engine_instances": 1,
-
-        "paddleocr_engine_initialization": (
-            "once_per_benchmark_process"
-        ),
-
-        "paddleocr_engine_scope": (
-            "one_python_process"
-        ),
-
-        "paddleocr_models": [
-            "PP-OCRv6_medium_det",
-            "PP-OCRv6_medium_rec",
-        ],
-
-        "paddleocr_optional_models_disabled": [
-            "PP-LCNet_x1_0_doc_ori",
-            "UVDoc",
-            "PP-LCNet_x1_0_textline_ori",
-        ],
-
-        "paddleocr_orientation_enabled": False,
-
-        "paddleocr_unwarping_enabled": False,
-
-        "paddleocr_textline_orientation_enabled": False,
-
-        "paddleocr_mkldnn_enabled": False,
-
-        # ====================================================
-        # MEASUREMENT NOTES
-        # ====================================================
-
         "measurement_notes": {
             "one_python_process": True,
 
@@ -2442,47 +1982,20 @@ def calculate_summary(
 
             "shared_paddleocr_engine": True,
 
-            "paddleocr_engine_instances": 1,
-
             "paddleocr_engine_initialization": (
                 "once_per_benchmark_process"
             ),
 
-            "paddleocr_engine_creation_location": (
-                "run_concurrent_benchmark "
-                "before ThreadPoolExecutor"
-            ),
-
-            "paddleocr_engine_recreation_per_pdf": (
-                False
-            ),
-
-            "paddleocr_engine_recreation_per_page": (
-                False
-            ),
-
-            "paddleocr_orientation_models_loaded": (
-                False
-            ),
-
-            "paddleocr_unwarping_model_loaded": (
-                False
-            ),
-
-            "paddleocr_textline_orientation_model_loaded": (
-                False
-            ),
-
-            "paddleocr_detection_model": (
-                "PP-OCRv6_medium_det"
-            ),
-
-            "paddleocr_recognition_model": (
-                "PP-OCRv6_medium_rec"
+            "paddleocr_engine_source": (
+                "app.services.ocr_service.get_ocr_engine"
             ),
 
             "ocr_inference_serialized_by_lock": (
                 True
+            ),
+
+            "ocr_engine_lock_source": (
+                "app.services.ocr_service.OCR_ENGINE_LOCK"
             ),
 
             "pdf_processing": (
@@ -2494,9 +2007,6 @@ def calculate_summary(
 
             "paddleocr_mkldnn": False,
 
-            "ocr_detection_limit_side_len": (OCR_DET_LIMIT),
-            "ocr_recognition_batch_size": (OCR_REC_BATCH_SIZE),  
-            
             "redis_used": False,
 
             "postgres_used": False,
@@ -2547,18 +2057,9 @@ def calculate_summary(
             "engine_sharing_definition": (
                 "All benchmark concurrency slots "
                 "run inside the same Python process "
-                "and use exactly one cached benchmark "
-                "PaddleOCR engine. OCR_ENGINE_LOCK "
-                "serializes calls to the shared engine."
-            ),
-
-            "memory_safety_definition": (
-                "The benchmark intentionally disables "
-                "document orientation classification, "
-                "document unwarping, and textline "
-                "orientation so that only the normal "
-                "OCR detection and recognition models "
-                "are initialized."
+                "and obtain the same cached PaddleOCR "
+                "engine. OCR_ENGINE_LOCK serializes "
+                "calls to the shared engine."
             ),
         },
     }
@@ -2573,19 +2074,6 @@ def run_concurrent_benchmark(
 ) -> list[
     dict[str, Any]
 ]:
-    """
-    Run the benchmark using one shared PaddleOCR engine.
-
-    IMPORTANT:
-
-    The engine is initialized BEFORE ThreadPoolExecutor
-    starts.
-
-    Therefore worker threads cannot race to create separate
-    PaddleOCR engines.
-
-    There is exactly one PaddleOCR object for all PDFs.
-    """
 
     print()
     print(
@@ -2593,8 +2081,7 @@ def run_concurrent_benchmark(
     )
 
     print(
-        "INITIALIZING LIGHTWEIGHT "
-        "SHARED PADDLEOCR ENGINE"
+        "INITIALIZING SHARED PADDLEOCR ENGINE"
     )
 
     print(
@@ -2602,48 +2089,27 @@ def run_concurrent_benchmark(
     )
 
     print(
-        "Engine ownership       : "
+        "Engine ownership  : "
         "ONE shared engine"
     )
 
     print(
-        "Initialization         : "
-        "ONCE per benchmark process"
+        "Initialization    : "
+        "once per benchmark process"
     )
 
     print(
-        "Models                 : "
-        "PP-OCRv6_medium_det + "
-        "PP-OCRv6_medium_rec"
-    )
-
-    print(
-        "Document orientation   : "
-        "DISABLED"
-    )
-
-    print(
-        "Document unwarping     : "
-        "DISABLED"
-    )
-
-    print(
-        "Textline orientation   : "
-        "DISABLED"
-    )
-
-    print(
-        "MKL-DNN                : "
+        "MKL-DNN           : "
         "False"
     )
 
     print(
-        "CPU threads            : "
+        "CPU threads       : "
         f"{OCR_CPU_THREADS}"
     )
 
     print(
-        "Device                 : "
+        "Device            : "
         f"{OCR_DEVICE}"
     )
 
@@ -2652,27 +2118,24 @@ def run_concurrent_benchmark(
     )
 
     # --------------------------------------------------------
-    # CRITICAL:
+    # IMPORTANT
     #
-    # Initialize the ONLY PaddleOCR engine BEFORE creating
-    # the concurrent worker threads.
+    # Initialize the engine BEFORE creating the worker
+    # threads.
+    #
+    # This guarantees that the benchmark starts with exactly
+    # one PaddleOCR engine in this Python process.
     # --------------------------------------------------------
 
-    initialize_shared_ocr_engine()
+    get_ocr_engine()
 
-    print()
     print(
-        "Shared lightweight PaddleOCR engine ready."
+        "Shared PaddleOCR engine initialized."
     )
 
     print(
-        "The SAME engine will be reused for "
-        "every benchmark document."
-    )
-
-    print(
-        "No PaddleOCR engine will be created "
-        "inside worker threads."
+        "The same engine will be reused "
+        "for all benchmark documents."
     )
 
     print(
@@ -2689,18 +2152,15 @@ def run_concurrent_benchmark(
     )
 
     print(
-        f"Worker process     : "
-        f"{WORKER_ID}"
+        f"Worker process     : {WORKER_ID}"
     )
 
     print(
-        f"Worker count       : "
-        f"{WORKER_COUNT}"
+        f"Worker count       : {WORKER_COUNT}"
     )
 
     print(
-        f"Concurrency        : "
-        f"{CONCURRENCY}"
+        f"Concurrency        : {CONCURRENCY}"
     )
 
     print(
@@ -2724,11 +2184,6 @@ def run_concurrent_benchmark(
     )
 
     print(
-        "OCR models         : "
-        "det + rec only"
-    )
-
-    print(
         "OCR lock           : "
         "enabled"
     )
@@ -2741,10 +2196,6 @@ def run_concurrent_benchmark(
         dict[str, Any]
     ] = []
 
-    # --------------------------------------------------------
-    # Thread pool
-    # --------------------------------------------------------
-
     with ThreadPoolExecutor(
         max_workers=CONCURRENCY,
         thread_name_prefix="ocr-slot",
@@ -2753,9 +2204,7 @@ def run_concurrent_benchmark(
         future_to_document = {}
 
         # ----------------------------------------------------
-        # Submit documents.
-        #
-        # No OCR engine is created here.
+        # Submit all documents
         # ----------------------------------------------------
 
         for document_number, pdf_path in enumerate(
@@ -2774,7 +2223,7 @@ def run_concurrent_benchmark(
             ] = document_number
 
         # ----------------------------------------------------
-        # Collect completed documents.
+        # Collect completed documents
         # ----------------------------------------------------
 
         for future in as_completed(
@@ -2810,7 +2259,7 @@ def run_concurrent_benchmark(
                 )
 
     # --------------------------------------------------------
-    # Restore document ordering.
+    # Restore document ordering
     # --------------------------------------------------------
 
     records.sort(
@@ -2887,15 +2336,7 @@ def main() -> None:
         f"PDF DPI       : "
         f"{PDF_DPI}"
     )
-    print(
-    f"Detection limit: "
-    f"{OCR_DET_LIMIT}px"
-    )
 
-    print(
-    f"Recognition batch: "
-    f"{OCR_REC_BATCH_SIZE}"
-    )
     print(
         f"Max retries   : "
         f"{MAX_RETRIES}"
@@ -2913,70 +2354,12 @@ def main() -> None:
 
     print(
         "PaddleOCR      : "
-        "1 shared lightweight engine"
-    )
-
-    print(
-        "Models         : "
-        "PP-OCRv6_medium_det + "
-        "PP-OCRv6_medium_rec"
-    )
-
-    print(
-        "Doc orientation: "
-        "disabled"
-    )
-
-    print(
-        "Unwarping      : "
-        "disabled"
-    )
-
-    print(
-        "Textline ori   : "
-        "disabled"
+        "1 shared engine"
     )
 
     print(
         "MKL-DNN        : "
         "False"
-    )
-
-    # --------------------------------------------------------
-    # Memory safety warning.
-    # --------------------------------------------------------
-
-    print()
-    print(
-        "MEMORY-SAFETY CONFIGURATION:"
-    )
-
-    print(
-        "  One PaddleOCR instance only"
-    )
-
-    print(
-        "  Detection + recognition models only"
-    )
-
-    print(
-        "  Document orientation disabled"
-    )
-
-    print(
-        "  Document unwarping disabled"
-    )
-
-    print(
-        "  Textline orientation disabled"
-    )
-
-    print(
-        "  PDF pages rendered one at a time"
-    )
-
-    print(
-        "  OCR inference protected by lock"
     )
 
     RESULTS_DIR.mkdir(
@@ -3018,7 +2401,7 @@ def main() -> None:
     )
 
     # --------------------------------------------------------
-    # Run benchmark
+    # Run concurrent OCR
     # --------------------------------------------------------
 
     records = (
@@ -3267,32 +2650,7 @@ def main() -> None:
 
     print(
         "Engine initialized : "
-        "ONCE"
-    )
-
-    print(
-        "Detection model    : "
-        "PP-OCRv6_medium_det"
-    )
-
-    print(
-        "Recognition model  : "
-        "PP-OCRv6_medium_rec"
-    )
-
-    print(
-        "Doc orientation    : "
-        "DISABLED"
-    )
-
-    print(
-        "Doc unwarping      : "
-        "DISABLED"
-    )
-
-    print(
-        "Textline orientation: "
-        "DISABLED"
+        "once"
     )
 
     print(
@@ -3322,6 +2680,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-
     main()
 

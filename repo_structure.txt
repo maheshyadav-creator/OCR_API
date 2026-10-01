@@ -1,0 +1,69 @@
+.
+├── app
+│   ├── core
+│   │   ├── config.py
+│   │   └── __init__.py
+│   ├── database
+│   │   ├── connection.py
+│   │   ├── __init__.py
+│   │   └── schema.sql
+│   ├── __init__.py
+│   ├── main.py
+│   ├── queue
+│   │   ├── __init__.py
+│   │   └── redis_queue.py
+│   ├── routes
+│   │   ├── __init__.py
+│   │   └── ocr.py
+│   ├── schemas
+│   │   ├── __init__.py
+│   │   └── ocr.py
+│   ├── services
+│   │   ├── file_service.py
+│   │   ├── __init__.py
+│   │   ├── ocr_service.py
+│   │   └── storage_service.py
+│   └── worker
+│       ├── cron_recovery.py
+│       ├── __init__.py
+│       ├── job_processor.py
+│       ├── ocr_worker.py
+│       ├── recovery.py
+│       ├── redis_consumer.py
+│       └── retry_handler.py
+├── benchmark_documents
+│   └── pdf.py
+├── benchmark_results
+├── docker
+│   └── ocr-recovery-cron
+├── docker-compose.yml
+├── Dockerfile
+├── .dockerignore
+├── .env
+├── .env.example
+├── .gitignore
+├── README.md
+├── repo_structure.txt
+├── requirements.txt
+├── test_images
+│   └── test.png
+├── test_ocr.py
+├── test_pdf
+│   ├── ocr_test_01.pdf
+│   ├── ocr_test_02.pdf
+│   ├── ocr_test_03.pdf
+│   ├── ocr_test_04.pdf
+│   ├── ocr_test_05.pdf
+│   ├── ocr_test_06.pdf
+│   ├── ocr_test_07.pdf
+│   ├── ocr_test_08.pdf
+│   ├── ocr_test_09.pdf
+│   └── ocr_test_10.pdf
+└── tests
+    ├── benchmark
+    │   ├── __init__.py
+    │   ├── two_worker_benchmark.py
+    │   └── two_worker_benchmark.py.backup
+    └── test_health.py
+
+15 directories, 51 files

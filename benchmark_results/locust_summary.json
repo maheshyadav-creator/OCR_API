@@ -1,0 +1,71 @@
+{
+  "duration_seconds": 919.6,
+  "jobs": {
+    "submitted": 13,
+    "done": 3,
+    "failed": 0,
+    "unfinished_when_stopped": 10,
+    "jobs_that_needed_retries": 0,
+    "failure_percent": 0.0
+  },
+  "failure_reasons": {},
+  "throughput": {
+    "documents_per_minute": 0.2,
+    "pages_per_minute": 0.78
+  },
+  "end_to_end_seconds_successful_jobs": {
+    "avg": 626.82,
+    "p50": 630.17,
+    "p95": 633.14,
+    "p99": 633.14,
+    "max": 633.14
+  },
+  "queue_wait_seconds_successful_jobs": {
+    "avg": 0.04,
+    "p50": 0.02,
+    "p95": 0.07,
+    "p99": 0.07,
+    "max": 0.07
+  },
+  "processing_seconds_successful_jobs": {
+    "avg": 624.42,
+    "p50": 629.6,
+    "p95": 632.09,
+    "p99": 632.09,
+    "max": 632.09
+  },
+  "queue": {
+    "peak_waiting_jobs": 7
+  },
+  "resources": {
+    "ocr_api-ocr_worker_1-1": {
+      "avg_cpu_percent": 243.4,
+      "peak_cpu_percent": 349.5,
+      "peak_mem_mb": 2080.8
+    },
+    "ocr_api": {
+      "avg_cpu_percent": 0.5,
+      "peak_cpu_percent": 4.0,
+      "peak_mem_mb": 25.5
+    },
+    "ocr_postgres": {
+      "avg_cpu_percent": 1.7,
+      "peak_cpu_percent": 11.3,
+      "peak_mem_mb": 37.2
+    },
+    "ocr_redis": {
+      "avg_cpu_percent": 1.3,
+      "peak_cpu_percent": 6.1,
+      "peak_mem_mb": 7.5
+    },
+    "ocr_cron": {
+      "avg_cpu_percent": 1.0,
+      "peak_cpu_percent": 71.9,
+      "peak_mem_mb": 161.7
+    }
+  },
+  "host": {
+    "lowest_available_mb": 101.1,
+    "peak_swap_used_mb": 4096.0
+  }
+}

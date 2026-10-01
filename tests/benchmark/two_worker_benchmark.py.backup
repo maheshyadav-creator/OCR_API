@@ -1,0 +1,1192 @@
+from __future__ import annotations
+
+import csv
+import json
+import multiprocessing as mp
+import os
+import queue
+import resource
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from statistics import mean
+
+import redis
+from pypdf import PdfReader
+
+from app.core.config import get_settings
+from app.services.ocr_service import get_ocr_engine, perform_ocr
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+PDF_DIR = Path(
+    os.getenv(
+        "BENCHMARK_PDF_DIR",
+        "/home/mahesh/Documents/OCR_API/test_pdf",
+    )
+)
+
+OUTPUT_DIR = Path(
+    os.getenv(
+        "BENCHMARK_OUTPUT_DIR",
+        "/app/benchmark_results",
+    )
+)
+
+PDF_COUNT = 10
+
+STREAM_PREFIX = "ocr_benchmark_jobs"
+GROUP_PREFIX = "ocr_benchmark_workers"
+
+REDIS_BLOCK_MS = 1000
+
+
+# ============================================================
+# TIME
+# ============================================================
+
+def utc_now() -> str:
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
+
+
+# ============================================================
+# REDIS
+# ============================================================
+
+def create_redis_client() -> redis.Redis:
+    """
+    Create an independent Redis connection.
+
+    Every benchmark worker gets its own Redis connection.
+    """
+
+    settings = get_settings()
+
+    redis_host = os.getenv(
+        "BENCHMARK_REDIS_HOST",
+        settings.redis_host,
+    )
+
+    redis_port = int(
+        os.getenv(
+            "BENCHMARK_REDIS_PORT",
+            settings.redis_port,
+        )
+    )
+
+    return redis.Redis(
+        host=redis_host,
+        port=redis_port,
+        decode_responses=True,
+    )
+
+
+# ============================================================
+# DOCUMENT DISCOVERY
+# ============================================================
+
+def collect_documents() -> list[dict]:
+    """
+    Find the 10 benchmark PDFs and collect
+    size + page count before OCR begins.
+    """
+
+    pdf_paths = sorted(
+        PDF_DIR.glob("ocr_test_*.pdf")
+    )[:PDF_COUNT]
+
+    if len(pdf_paths) != PDF_COUNT:
+        raise RuntimeError(
+            f"Expected {PDF_COUNT} PDFs in "
+            f"{PDF_DIR}, but found {len(pdf_paths)}."
+        )
+
+    documents = []
+
+    for pdf_path in pdf_paths:
+
+        file_size_bytes = pdf_path.stat().st_size
+
+        reader = PdfReader(
+            str(pdf_path)
+        )
+
+        page_count = len(
+            reader.pages
+        )
+
+        documents.append(
+            {
+                "job_id": str(
+                    uuid.uuid4()
+                ),
+                "filename": pdf_path.name,
+                "path": str(pdf_path),
+                "size_bytes": file_size_bytes,
+                "size_mb": (
+                    file_size_bytes
+                    / (1024 * 1024)
+                ),
+                "page_count": page_count,
+            }
+        )
+
+    return documents
+
+
+# ============================================================
+# BENCHMARK WORKER
+# ============================================================
+
+def benchmark_worker(
+    worker_number: int,
+    stream_name: str,
+    consumer_group: str,
+    result_queue: mp.Queue,
+    ready_queue: mp.Queue,
+    stop_event: mp.Event,
+) -> None:
+
+    worker_id = (
+        f"benchmark-worker-{worker_number}"
+    )
+
+    redis_client = create_redis_client()
+
+    try:
+
+        # ----------------------------------------------------
+        # Create Redis consumer group
+        # ----------------------------------------------------
+
+        try:
+
+            redis_client.xgroup_create(
+                name=stream_name,
+                groupname=consumer_group,
+                id="0",
+                mkstream=True,
+            )
+
+        except redis.exceptions.ResponseError as exc:
+
+            if "BUSYGROUP" not in str(exc):
+                raise
+
+        # ----------------------------------------------------
+        # PaddleOCR warm-up
+        # ----------------------------------------------------
+        #
+        # IMPORTANT:
+        # Model loading is NOT included in per-PDF OCR time.
+        #
+        # Each worker has its own PaddleOCR engine.
+        # ----------------------------------------------------
+
+        warmup_start = time.perf_counter()
+
+        get_ocr_engine()
+
+        warmup_seconds = (
+            time.perf_counter()
+            - warmup_start
+        )
+
+        ready_queue.put(
+            {
+                "worker_id": worker_id,
+                "warmup_seconds": (
+                    warmup_seconds
+                ),
+            }
+        )
+
+        # ----------------------------------------------------
+        # Consume benchmark jobs
+        # ----------------------------------------------------
+
+        while not stop_event.is_set():
+
+            messages = (
+                redis_client.xreadgroup(
+                    groupname=consumer_group,
+                    consumername=worker_id,
+                    streams={
+                        stream_name: ">"
+                    },
+                    count=1,
+                    block=REDIS_BLOCK_MS,
+                )
+            )
+
+            if not messages:
+                continue
+
+            for _, entries in messages:
+
+                for message_id, data in entries:
+
+                    if stop_event.is_set():
+                        break
+
+                    # ----------------------------------------
+                    # Job information
+                    # ----------------------------------------
+
+                    job_id = data["job_id"]
+                    file_path = data["path"]
+
+                    # ----------------------------------------
+                    # OCR timing starts HERE
+                    # ----------------------------------------
+
+                    start_time = utc_now()
+
+                    wall_start = (
+                        time.perf_counter()
+                    )
+
+                    cpu_start = (
+                        time.process_time()
+                    )
+
+                    try:
+
+                        ocr_result = perform_ocr(
+                            file_path
+                        )
+
+                        status = "success"
+
+                        error_message = ""
+
+                        confidence = float(
+                            ocr_result.get(
+                                "confidence",
+                                0.0,
+                            )
+                        )
+
+                        page_count = int(
+                            ocr_result.get(
+                                "page_count",
+                                0,
+                            )
+                        )
+
+                    except Exception as exc:
+
+                        status = "failed"
+
+                        error_message = (
+                            f"{type(exc).__name__}: "
+                            f"{exc}"
+                        )
+
+                        confidence = 0.0
+
+                        page_count = int(
+                            data.get(
+                                "page_count",
+                                0,
+                            )
+                        )
+
+                    # ----------------------------------------
+                    # OCR timing ends HERE
+                    # ----------------------------------------
+
+                    wall_time_seconds = (
+                        time.perf_counter()
+                        - wall_start
+                    )
+
+                    cpu_time_seconds = (
+                        time.process_time()
+                        - cpu_start
+                    )
+
+                    # Linux:
+                    # ru_maxrss is reported in KiB.
+                    peak_rss_kb = resource.getrusage(
+                        resource.RUSAGE_SELF
+                    ).ru_maxrss
+
+                    peak_rss_mb = (
+                        peak_rss_kb / 1024
+                    )
+
+                    result = {
+                        "job_id": job_id,
+                        "worker_id": worker_id,
+                        "filename": data[
+                            "filename"
+                        ],
+                        "size_bytes": int(
+                            data["size_bytes"]
+                        ),
+                        "size_mb": float(
+                            data["size_mb"]
+                        ),
+                        "page_count": page_count,
+                        "start_time": start_time,
+                        "end_time": utc_now(),
+                        "wall_time_seconds": (
+                            wall_time_seconds
+                        ),
+                        "cpu_time_seconds": (
+                            cpu_time_seconds
+                        ),
+                        "peak_rss_mb": (
+                            peak_rss_mb
+                        ),
+                        "confidence": confidence,
+                        "status": status,
+                        "error": error_message,
+                        "redis_message_id": (
+                            message_id
+                        ),
+                    }
+
+                    # ----------------------------------------
+                    # ACK Redis message
+                    # ----------------------------------------
+
+                    redis_client.xack(
+                        stream_name,
+                        consumer_group,
+                        message_id,
+                    )
+
+                    # ----------------------------------------
+                    # Send result to parent process
+                    # ----------------------------------------
+
+                    result_queue.put(
+                        {
+                            "type": "result",
+                            "result": result,
+                        }
+                    )
+
+    finally:
+
+        redis_client.close()
+
+
+# ============================================================
+# RUN ONE BENCHMARK SCENARIO
+# ============================================================
+
+def run_scenario(
+    worker_count: int,
+    documents: list[dict],
+) -> dict:
+
+    run_id = uuid.uuid4().hex[:10]
+
+    stream_name = (
+        f"{STREAM_PREFIX}_"
+        f"{worker_count}w_"
+        f"{run_id}"
+    )
+
+    consumer_group = (
+        f"{GROUP_PREFIX}_"
+        f"{run_id}"
+    )
+
+    result_queue = mp.Queue()
+
+    ready_queue = mp.Queue()
+
+    stop_event = mp.Event()
+
+    processes = []
+
+    # --------------------------------------------------------
+    # Start benchmark workers
+    # --------------------------------------------------------
+
+    for worker_number in range(
+        1,
+        worker_count + 1,
+    ):
+
+        process = mp.Process(
+            target=benchmark_worker,
+            args=(
+                worker_number,
+                stream_name,
+                consumer_group,
+                result_queue,
+                ready_queue,
+                stop_event,
+            ),
+        )
+
+        process.start()
+
+        processes.append(process)
+
+    # --------------------------------------------------------
+    # Wait for all workers to warm up
+    # --------------------------------------------------------
+
+    warmups = []
+
+    for _ in range(worker_count):
+
+        try:
+
+            warmup = ready_queue.get(
+                timeout=600
+            )
+
+        except queue.Empty:
+
+            raise RuntimeError(
+                "A benchmark worker did not "
+                "finish PaddleOCR warm-up "
+                "within 10 minutes."
+            )
+
+        warmups.append(warmup)
+
+    # --------------------------------------------------------
+    # Add jobs to Redis Stream
+    # --------------------------------------------------------
+
+    redis_client = create_redis_client()
+
+    try:
+
+        for document in documents:
+
+            redis_client.xadd(
+                stream_name,
+                {
+                    "job_id": document[
+                        "job_id"
+                    ],
+                    "filename": document[
+                        "filename"
+                    ],
+                    "path": document[
+                        "path"
+                    ],
+                    "size_bytes": str(
+                        document[
+                            "size_bytes"
+                        ]
+                    ),
+                    "size_mb": str(
+                        document[
+                            "size_mb"
+                        ]
+                    ),
+                    "page_count": str(
+                        document[
+                            "page_count"
+                        ]
+                    ),
+                },
+            )
+
+        # ----------------------------------------------------
+        # Start overall benchmark clock
+        # ----------------------------------------------------
+
+        benchmark_start_timestamp = utc_now()
+
+        benchmark_start = (
+            time.perf_counter()
+        )
+
+        results = []
+
+        # ----------------------------------------------------
+        # Wait for all PDFs
+        # ----------------------------------------------------
+
+        while len(results) < len(documents):
+
+            message = result_queue.get(
+                timeout=1800
+            )
+
+            if message["type"] == "result":
+
+                results.append(
+                    message["result"]
+                )
+
+        benchmark_wall_time = (
+            time.perf_counter()
+            - benchmark_start
+        )
+
+        benchmark_end_timestamp = utc_now()
+
+    finally:
+
+        stop_event.set()
+
+        # ----------------------------------------------------
+        # Stop workers
+        # ----------------------------------------------------
+
+        for process in processes:
+
+            process.join(
+                timeout=5
+            )
+
+        for process in processes:
+
+            if process.is_alive():
+
+                process.terminate()
+
+                process.join()
+
+        # ----------------------------------------------------
+        # Delete benchmark Redis stream
+        # ----------------------------------------------------
+
+        try:
+
+            redis_client.delete(
+                stream_name
+            )
+
+            redis_client.xgroup_destroy(
+                stream_name,
+                consumer_group,
+            )
+
+        except Exception:
+            pass
+
+        redis_client.close()
+
+    # --------------------------------------------------------
+    # Sort results by filename
+    # --------------------------------------------------------
+
+    results.sort(
+        key=lambda item: item[
+            "filename"
+        ]
+    )
+
+    return {
+        "run_id": run_id,
+        "workers": worker_count,
+        "stream": stream_name,
+        "consumer_group": consumer_group,
+        "benchmark_start": (
+            benchmark_start_timestamp
+        ),
+        "benchmark_end": (
+            benchmark_end_timestamp
+        ),
+        "total_wall_time_seconds": (
+            benchmark_wall_time
+        ),
+        "warmups": warmups,
+        "results": results,
+    }
+
+
+# ============================================================
+# OVERALL METRICS
+# ============================================================
+
+def calculate_overall_metrics(
+    benchmark: dict,
+) -> dict:
+
+    successful = [
+        result
+        for result in benchmark["results"]
+        if result["status"] == "success"
+    ]
+
+    total_size_mb = sum(
+        result["size_mb"]
+        for result in successful
+    )
+
+    total_pages = sum(
+        result["page_count"]
+        for result in successful
+    )
+
+    total_ocr_time = sum(
+        result["wall_time_seconds"]
+        for result in successful
+    )
+
+    benchmark_wall_time = (
+        benchmark[
+            "total_wall_time_seconds"
+        ]
+    )
+
+    return {
+        "workers": benchmark["workers"],
+        "documents": len(
+            benchmark["results"]
+        ),
+        "successful": len(
+            successful
+        ),
+        "failed": (
+            len(benchmark["results"])
+            - len(successful)
+        ),
+        "total_size_mb": (
+            total_size_mb
+        ),
+        "total_pages": total_pages,
+        "total_ocr_time_seconds": (
+            total_ocr_time
+        ),
+        "benchmark_wall_time_seconds": (
+            benchmark_wall_time
+        ),
+        "average_ocr_time_per_pdf": (
+            mean(
+                [
+                    result[
+                        "wall_time_seconds"
+                    ]
+                    for result in successful
+                ]
+            )
+            if successful
+            else 0.0
+        ),
+        "average_time_per_mb": (
+            total_ocr_time / total_size_mb
+            if total_size_mb
+            else 0.0
+        ),
+        "average_time_per_page": (
+            total_ocr_time / total_pages
+            if total_pages
+            else 0.0
+        ),
+        "throughput_mb_per_second": (
+            total_size_mb
+            / benchmark_wall_time
+            if benchmark_wall_time
+            else 0.0
+        ),
+        "throughput_pages_per_second": (
+            total_pages
+            / benchmark_wall_time
+            if benchmark_wall_time
+            else 0.0
+        ),
+        "average_confidence": (
+            mean(
+                [
+                    result[
+                        "confidence"
+                    ]
+                    for result in successful
+                ]
+            )
+            if successful
+            else 0.0
+        ),
+        "maximum_peak_rss_mb": max(
+            [
+                result[
+                    "peak_rss_mb"
+                ]
+                for result in successful
+            ],
+            default=0.0,
+        ),
+    }
+
+
+# ============================================================
+# PER-WORKER SUMMARY
+# ============================================================
+
+def calculate_worker_summaries(
+    results: list[dict],
+) -> list[dict]:
+
+    worker_ids = sorted(
+        {
+            result["worker_id"]
+            for result in results
+        }
+    )
+
+    summaries = []
+
+    for worker_id in worker_ids:
+
+        worker_results = [
+            result
+            for result in results
+            if result["worker_id"]
+            == worker_id
+        ]
+
+        successful = [
+            result
+            for result in worker_results
+            if result["status"]
+            == "success"
+        ]
+
+        total_size_mb = sum(
+            result["size_mb"]
+            for result in successful
+        )
+
+        total_pages = sum(
+            result["page_count"]
+            for result in successful
+        )
+
+        total_ocr_time = sum(
+            result["wall_time_seconds"]
+            for result in successful
+        )
+
+        summaries.append(
+            {
+                "worker_id": worker_id,
+                "documents_processed": (
+                    len(worker_results)
+                ),
+                "successful": len(
+                    successful
+                ),
+                "failed": (
+                    len(worker_results)
+                    - len(successful)
+                ),
+                "total_size_mb": (
+                    total_size_mb
+                ),
+                "total_pages": (
+                    total_pages
+                ),
+                "total_ocr_time_seconds": (
+                    total_ocr_time
+                ),
+                "average_time_per_pdf": (
+                    mean(
+                        [
+                            result[
+                                "wall_time_seconds"
+                            ]
+                            for result in successful
+                        ]
+                    )
+                    if successful
+                    else 0.0
+                ),
+                "average_time_per_mb": (
+                    total_ocr_time
+                    / total_size_mb
+                    if total_size_mb
+                    else 0.0
+                ),
+                "average_time_per_page": (
+                    total_ocr_time
+                    / total_pages
+                    if total_pages
+                    else 0.0
+                ),
+                "throughput_mb_per_sec": (
+                    total_size_mb
+                    / total_ocr_time
+                    if total_ocr_time
+                    else 0.0
+                ),
+                "throughput_pages_per_sec": (
+                    total_pages
+                    / total_ocr_time
+                    if total_ocr_time
+                    else 0.0
+                ),
+                "maximum_peak_rss_mb": max(
+                    [
+                        result[
+                            "peak_rss_mb"
+                        ]
+                        for result in successful
+                    ],
+                    default=0.0,
+                ),
+            }
+        )
+
+    return summaries
+
+
+# ============================================================
+# SAVE RESULTS
+# ============================================================
+
+def save_results(
+    benchmark: dict,
+) -> None:
+
+    if benchmark["workers"] == 1:
+
+        scenario_name = "single_worker"
+
+    else:
+
+        scenario_name = "two_workers"
+
+    output_directory = (
+        OUTPUT_DIR
+        / scenario_name
+    )
+
+    output_directory.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    # --------------------------------------------------------
+    # CSV
+    # --------------------------------------------------------
+
+    csv_path = (
+        output_directory
+        / "per_document.csv"
+    )
+
+    with csv_path.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as file:
+
+        fields = list(
+            benchmark["results"][0].keys()
+        )
+
+        writer = csv.DictWriter(
+            file,
+            fieldnames=fields,
+        )
+
+        writer.writeheader()
+
+        writer.writerows(
+            benchmark["results"]
+        )
+
+    # --------------------------------------------------------
+    # JSON summary
+    # --------------------------------------------------------
+
+    summary = {
+        "run_id": benchmark[
+            "run_id"
+        ],
+        "workers": benchmark[
+            "workers"
+        ],
+        "stream": benchmark[
+            "stream"
+        ],
+        "consumer_group": benchmark[
+            "consumer_group"
+        ],
+        "benchmark_start": benchmark[
+            "benchmark_start"
+        ],
+        "benchmark_end": benchmark[
+            "benchmark_end"
+        ],
+        "total_wall_time_seconds": (
+            benchmark[
+                "total_wall_time_seconds"
+            ]
+        ),
+        "warmups": benchmark[
+            "warmups"
+        ],
+        "overall": (
+            calculate_overall_metrics(
+                benchmark
+            )
+        ),
+        "worker_summaries": (
+            calculate_worker_summaries(
+                benchmark[
+                    "results"
+                ]
+            )
+        ),
+    }
+
+    json_path = (
+        output_directory
+        / "summary.json"
+    )
+
+    with json_path.open(
+        "w",
+        encoding="utf-8",
+    ) as file:
+
+        json.dump(
+            summary,
+            file,
+            indent=2,
+        )
+
+
+# ============================================================
+# PRINT RESULTS
+# ============================================================
+
+def print_results(
+    benchmark: dict,
+) -> None:
+
+    metrics = (
+        calculate_overall_metrics(
+            benchmark
+        )
+    )
+
+    print()
+    print("=" * 70)
+    print(
+        f"{benchmark['workers']}-WORKER BENCHMARK"
+    )
+    print("=" * 70)
+
+    for key, value in metrics.items():
+
+        print(
+            f"{key}: {value}"
+        )
+
+    print()
+    print("WORKER DISTRIBUTION")
+    print("-" * 70)
+
+    summaries = (
+        calculate_worker_summaries(
+            benchmark["results"]
+        )
+    )
+
+    for summary in summaries:
+
+        print(
+            f"\nWorker: "
+            f"{summary['worker_id']}"
+        )
+
+        print(
+            f"  PDFs: "
+            f"{summary['documents_processed']}"
+        )
+
+        print(
+            f"  Total MB: "
+            f"{summary['total_size_mb']:.3f}"
+        )
+
+        print(
+            f"  Total pages: "
+            f"{summary['total_pages']}"
+        )
+
+        print(
+            f"  Total OCR time: "
+            f"{summary['total_ocr_time_seconds']:.3f}s"
+        )
+
+        print(
+            f"  Average/PDF: "
+            f"{summary['average_time_per_pdf']:.3f}s"
+        )
+
+        print(
+            f"  Average/MB: "
+            f"{summary['average_time_per_mb']:.3f}s"
+        )
+
+        print(
+            f"  Average/page: "
+            f"{summary['average_time_per_page']:.3f}s"
+        )
+
+        print(
+            f"  MB/sec: "
+            f"{summary['throughput_mb_per_sec']:.3f}"
+        )
+
+        print(
+            f"  Pages/sec: "
+            f"{summary['throughput_pages_per_sec']:.3f}"
+        )
+
+        print(
+            f"  Peak RSS: "
+            f"{summary['maximum_peak_rss_mb']:.2f} MB"
+        )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main() -> None:
+
+    # Linux uses multiprocessing with separate processes.
+    mp.set_start_method(
+        "spawn",
+        force=True,
+    )
+
+    print()
+    print("=" * 70)
+    print("OCR TWO-WORKER BENCHMARK")
+    print("=" * 70)
+
+    # --------------------------------------------------------
+    # Find PDFs
+    # --------------------------------------------------------
+
+    documents = collect_documents()
+
+    print()
+    print(
+        f"Found {len(documents)} PDFs:"
+    )
+
+    for document in documents:
+
+        print(
+            f"  {document['filename']} | "
+            f"{document['size_mb']:.3f} MB | "
+            f"{document['page_count']} pages"
+        )
+
+    # --------------------------------------------------------
+    # Run BOTH experiments
+    # --------------------------------------------------------
+
+    benchmark_results = []
+
+    for worker_count in (
+        1,
+        2,
+    ):
+
+        print()
+        print(
+            f"Starting "
+            f"{worker_count}-worker benchmark..."
+        )
+
+        benchmark = run_scenario(
+            worker_count,
+            documents,
+        )
+
+        save_results(
+            benchmark
+        )
+
+        print_results(
+            benchmark
+        )
+
+        benchmark_results.append(
+            benchmark
+        )
+
+    # --------------------------------------------------------
+    # FINAL COMPARISON
+    # --------------------------------------------------------
+
+    print()
+    print("=" * 70)
+    print("1 WORKER vs 2 WORKERS")
+    print("=" * 70)
+
+    for benchmark in benchmark_results:
+
+        metrics = (
+            calculate_overall_metrics(
+                benchmark
+            )
+        )
+
+        print()
+        print(
+            f"{benchmark['workers']} worker(s)"
+        )
+
+        print(
+            f"  Wall time: "
+            f"{metrics['benchmark_wall_time_seconds']:.3f}s"
+        )
+
+        print(
+            f"  Average/PDF: "
+            f"{metrics['average_ocr_time_per_pdf']:.3f}s"
+        )
+
+        print(
+            f"  Average/MB: "
+            f"{metrics['average_time_per_mb']:.3f}s"
+        )
+
+        print(
+            f"  Average/page: "
+            f"{metrics['average_time_per_page']:.3f}s"
+        )
+
+        print(
+            f"  MB/sec: "
+            f"{metrics['throughput_mb_per_second']:.3f}"
+        )
+
+        print(
+            f"  Pages/sec: "
+            f"{metrics['throughput_pages_per_second']:.3f}"
+        )
+
+        print(
+            f"  Peak RSS: "
+            f"{metrics['maximum_peak_rss_mb']:.2f} MB"
+        )
+
+    print()
+    print(
+        f"Results saved to: "
+        f"{OUTPUT_DIR}"
+    )
+
+
+if __name__ == "__main__":
+    main()
