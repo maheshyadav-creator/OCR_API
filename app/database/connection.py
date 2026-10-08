@@ -4,11 +4,13 @@ from typing import Generator
 
 import psycopg2
 from psycopg2 import pool
+from psycopg2.extras import register_uuid
 from psycopg2.extensions import connection as PGConnection
 
 from app.core.config import get_settings
 
 
+register_uuid()
 _connection_pool: pool.ThreadedConnectionPool | None = None
 
 

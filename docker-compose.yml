@@ -32,22 +32,34 @@ services:
 
 
   # ==========================================================
-  # Redis
+  # RabbitMQ - Celery Broker
   # ==========================================================
 
-  redis:
-    image: redis:7-alpine
-    container_name: ocr_redis
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: ocr_rabbitmq
     restart: unless-stopped
 
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+
     ports:
-      - "6379:6379"
+      # AMQP - Celery communication
+      - "5672:5672"
+
+      # RabbitMQ Management UI
+      - "15672:15672"
+
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
 
     healthcheck:
       test:
         [
           "CMD",
-          "redis-cli",
+          "rabbitmq-diagnostics",
+          "-q",
           "ping"
         ]
       interval: 5s
@@ -71,163 +83,95 @@ services:
       - .env
 
     environment:
+      # PostgreSQL
       DB_HOST: db
       DB_PORT: 5432
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
+
+      # Celery / RabbitMQ
+      CELERY_BROKER_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672//
 
     ports:
       - "8000:8000"
 
     volumes:
+      # Uploaded PDFs are temporarily stored here.
+      # The API and Celery worker share this volume.
       - ocr_storage:/app/storage
 
     depends_on:
       db:
         condition: service_healthy
-      redis:
+
+      rabbitmq:
         condition: service_healthy
 
 
   # ==========================================================
-  # Production Worker 1
+  # Celery OCR Worker
+  # ==========================================================
+  #
+  # IMPORTANT:
+  #
+  # One container
+  # One Celery worker process
+  # One OCR job at a time
+  #
+  # This keeps PaddleOCR RAM usage under control.
+  #
+  # Celery message contains only job_id.
+  # PDF remains on the shared ocr_storage volume.
+  #
   # ==========================================================
 
-  ocr_worker_1:
-    image: ocr_api-api:latest
-    restart: unless-stopped
-
-    env_file:
-      - .env
-
-    environment:
-      DB_HOST: db
-      DB_PORT: 5432
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-
-    volumes:
-      - ocr_storage:/app/storage
-
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-
-    command:
-      [
-        "python",
-        "-m",
-        "app.worker.ocr_worker"
-      ]
-
-
-  # ==========================================================
-  # Production Worker 2
-  # ==========================================================
-
-  ocr_worker_2:
-    image: ocr_api-api:latest
-    restart: unless-stopped
-
-    env_file:
-      - .env
-
-    environment:
-      DB_HOST: db
-      DB_PORT: 5432
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-
-    volumes:
-      - ocr_storage:/app/storage
-
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-
-    command:
-      [
-        "python",
-        "-m",
-        "app.worker.ocr_worker"
-      ]
-
-
-  # ==========================================================
-  # Production Worker 3
-  # ==========================================================
-
-  ocr_worker_3:
-    image: ocr_api-api:latest
-    restart: unless-stopped
-
-    env_file:
-      - .env
-
-    environment:
-      DB_HOST: db
-      DB_PORT: 5432
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-
-    volumes:
-      - ocr_storage:/app/storage
-
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-
-    command:
-      [
-        "python",
-        "-m",
-        "app.worker.ocr_worker"
-      ]
-
-
-  # ==========================================================
-  # Cron / Recovery
-  # ==========================================================
-
-  cron:
+  celery_worker:
     build:
       context: .
       dockerfile: Dockerfile
 
-    container_name: ocr_cron
+    container_name: ocr_celery_worker
     restart: unless-stopped
 
     env_file:
       - .env
 
     environment:
+      # PostgreSQL
       DB_HOST: db
       DB_PORT: 5432
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
+
+      # Celery / RabbitMQ
+      CELERY_BROKER_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672//
 
     volumes:
+      # Same volume used by FastAPI.
+      #
+      # API:
+      #   /app/storage/jobs/<job_id>.pdf
+      #
+      # Worker:
+      #   reads the same file
+      #   runs OCR
+      #   deletes it after completion/final failure
+      #
       - ocr_storage:/app/storage
 
     depends_on:
       db:
         condition: service_healthy
-      redis:
+
+      rabbitmq:
         condition: service_healthy
 
     command:
-      - sh
-      - -c
-      - |
-        env | grep -E '^(DB_|REDIS_)' | sed 's/^/export /' > /etc/ocr-cron.env
-        chmod 600 /etc/ocr-cron.env
-        exec cron -f
+      [
+        "celery",
+        "-A",
+        "app.celery_app",
+        "worker",
+        "--loglevel=INFO",
+        "--concurrency=1",
+        "--prefetch-multiplier=1"
+      ]
 
 
 # ============================================================
@@ -236,6 +180,11 @@ services:
 
 volumes:
 
+  # PostgreSQL persistent database storage
   postgres_data:
 
+  # Temporary OCR files
   ocr_storage:
+
+  # RabbitMQ persistent broker state
+  rabbitmq_data:

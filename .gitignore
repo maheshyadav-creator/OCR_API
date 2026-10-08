@@ -40,3 +40,15 @@ outputs/
 
 # Docker
 docker-data/
+
+# Test data
+test_pdf/
+
+# Benchmark generated results
+benchmark_results/
+
+# Backup / temporary source files
+*.backup
+*.save
+*.before_db_fix
+*.before_pymupdf4llm_refactor

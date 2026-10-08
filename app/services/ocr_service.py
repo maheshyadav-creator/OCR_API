@@ -3,13 +3,12 @@ from __future__ import annotations
 import gc
 import os
 import threading
-import time
 from pathlib import Path
 from typing import Any
 
-import fitz
 import numpy as np
 from paddleocr import PaddleOCR
+from pymupdf4llm.ocr.exec_ocr_interface import exec_ocr_full
 
 from app.core.config import get_settings
 
@@ -18,55 +17,61 @@ from app.core.config import get_settings
 # CONFIGURATION
 # ============================================================
 #
-# Every value can be changed with an environment variable
-# (for example in docker-compose.yml) without editing code.
+# PaddleOCR is now responsible only for OCR inference.
 #
-# Defaults are the settings that were measured on the 7.5 GiB
-# laptop: ~20 s/page and ~2 GB peak memory per OCR process.
+# PDF rendering / PDF page decisions are NOT handled here.
+#
+# PDF processing will be handled by:
+#
+#     PyMuPDF4LLM
+#            ↓
+#     PyMuPDF4LLM OCR decision
+#            ↓
+#     PaddleOCR adapter
+#            ↓
+#     PaddleOCR 3.7.0
+#
+# This keeps PDF orchestration outside this service.
 # ============================================================
 
-# PDF page rendering resolution.
-PDF_DPI = int(os.getenv("OCR_PDF_DPI", "200"))
+OCR_CPU_THREADS = int(
+    os.getenv("OCR_CPU_THREADS", "2")
+)
 
-# Never render a page with a longer side than this many pixels.
-# A4 at 200 DPI is 2339 px, so normal pages are unchanged;
-# only huge pages (posters, A0 drawings) are scaled down.
-MAX_RENDER_SIDE_PX = int(os.getenv("OCR_MAX_RENDER_SIDE_PX", "2400"))
+OCR_DET_LIMIT_SIDE_LEN = int(
+    os.getenv("OCR_DET_LIMIT_SIDE_LEN", "1280")
+)
 
-# CPU threads used by Paddle inside ONE inference.
-# 2 was the fastest on this machine (3+ was slower).
-OCR_CPU_THREADS = int(os.getenv("OCR_CPU_THREADS", "2"))
-
-# Text detection runs on an image whose longest side is at most
-# this many pixels. This is the biggest memory/speed lever:
-# 1280 -> ~2 GB peak, 960 -> ~1.5 GB peak and faster.
-# Check extracted text length before going below 1280.
-OCR_DET_LIMIT_SIDE_LEN = int(os.getenv("OCR_DET_LIMIT_SIDE_LEN", "1280"))
-
-# Number of text lines recognised at once.
-OCR_REC_BATCH_SIZE = int(os.getenv("OCR_REC_BATCH_SIZE", "2"))
-
-# 0 = no limit. Set e.g. 100 to reject very long PDFs.
-MAX_PDF_PAGES = int(os.getenv("OCR_MAX_PDF_PAGES", "0"))
-
-# Only ONE inference may run at a time on the shared engine.
-OCR_ENGINE_LOCK = threading.Lock()
+OCR_REC_BATCH_SIZE = int(
+    os.getenv("OCR_REC_BATCH_SIZE", "2")
+)
 
 
 # ============================================================
-# PADDLEOCR ENGINE  (exactly one per Python process)
+# SHARED PADDLEOCR ENGINE
 # ============================================================
 #
-# This replaces @lru_cache. lru_cache does NOT stop two threads
-# from both building an engine when they call it at the same
-# moment on the first job. The lock below does.
+# Exactly ONE PaddleOCR engine per Python process.
+#
+# The engine is created lazily on the first request.
+#
+# _ENGINE_INIT_LOCK protects engine creation.
+# OCR_ENGINE_LOCK protects inference on the shared engine.
 # ============================================================
 
 _ENGINE: PaddleOCR | None = None
+
 _ENGINE_INIT_LOCK = threading.Lock()
+
+OCR_ENGINE_LOCK = threading.Lock()
 
 
 def _create_engine() -> PaddleOCR:
+    """
+    Create the single PaddleOCR 3.7.0 engine used by this
+    Python process.
+    """
+
     settings = get_settings()
 
     print("=" * 70)
@@ -74,9 +79,14 @@ def _create_engine() -> PaddleOCR:
     print(f"OCR language            : {settings.ocr_lang}")
     print(f"OCR device              : {settings.ocr_device}")
     print(f"OCR CPU threads         : {OCR_CPU_THREADS}")
-    print(f"Detection side limit    : {OCR_DET_LIMIT_SIDE_LEN}px")
-    print(f"Recognition batch size  : {OCR_REC_BATCH_SIZE}")
-    print(f"PDF DPI / max side      : {PDF_DPI} / {MAX_RENDER_SIDE_PX}px")
+    print(
+        f"Detection side limit    : "
+        f"{OCR_DET_LIMIT_SIDE_LEN}px"
+    )
+    print(
+        f"Recognition batch size  : "
+        f"{OCR_REC_BATCH_SIZE}"
+    )
     print("Orientation/unwarping   : disabled")
     print("MKL-DNN                 : False")
     print("=" * 70)
@@ -84,24 +94,35 @@ def _create_engine() -> PaddleOCR:
     return PaddleOCR(
         lang=settings.ocr_lang,
         device=settings.ocr_device,
-        # MKL-DNN crashes on this Paddle build.
+
+        # MKL-DNN is disabled for this project.
         enable_mkldnn=False,
+
+        # CPU inference tuning.
         cpu_threads=OCR_CPU_THREADS,
-        # Optional models: not loaded.
+
+        # Do not load unnecessary document models.
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
         use_textline_orientation=False,
-        # Memory/speed control for the detection model.
+
+        # Detection memory/speed control.
         text_det_limit_type="max",
         text_det_limit_side_len=OCR_DET_LIMIT_SIDE_LEN,
+
+        # Recognition batch size.
         text_recognition_batch_size=OCR_REC_BATCH_SIZE,
     )
 
 
 def get_ocr_engine() -> PaddleOCR:
     """
-    Return the single shared PaddleOCR engine, creating it
-    on the first call. Safe to call from many threads.
+    Return the single shared PaddleOCR engine.
+
+    The engine is created only once per Python process.
+
+    Safe for multiple callers because engine initialization
+    is protected by _ENGINE_INIT_LOCK.
     """
 
     global _ENGINE
@@ -124,7 +145,15 @@ def get_ocr_engine() -> PaddleOCR:
 def _extract_page_result(
     result: Any,
     page_number: int,
-) -> tuple[dict[str, Any], str, list[float]]:
+) -> tuple[
+    dict[str, Any],
+    str,
+    list[float],
+]:
+    """
+    Convert one PaddleOCR 3.7.0 result into the application's
+    simple page-level representation.
+    """
 
     try:
         result_data = result.json
@@ -140,18 +169,32 @@ def _extract_page_result(
     if not isinstance(result_data, dict):
         result_data = {}
 
-    data = result_data.get("res", result_data)
+    data = result_data.get(
+        "res",
+        result_data,
+    )
 
     if not isinstance(data, dict):
         data = {}
 
-    texts = data.get("rec_texts", [])
-    scores = data.get("rec_scores", [])
+    texts = data.get(
+        "rec_texts",
+        [],
+    )
+
+    scores = data.get(
+        "rec_scores",
+        [],
+    )
 
     page_text_parts: list[str] = []
+
     confidence_values: list[float] = []
 
-    for text, score in zip(texts, scores):
+    for text, score in zip(
+        texts,
+        scores,
+    ):
 
         text = str(text).strip()
 
@@ -160,20 +203,32 @@ def _extract_page_result(
 
         try:
             confidence = float(score)
-        except (TypeError, ValueError):
+        except (
+            TypeError,
+            ValueError,
+        ):
             continue
 
         page_text_parts.append(text)
-        confidence_values.append(confidence)
 
-    page_text = "\n".join(page_text_parts)
+        confidence_values.append(
+            confidence
+        )
+
+    page_text = "\n".join(
+        page_text_parts
+    )
 
     page_data = {
         "page": page_number,
         "text": page_text,
     }
 
-    return page_data, page_text, confidence_values
+    return (
+        page_data,
+        page_text,
+        confidence_values,
+    )
 
 
 # ============================================================
@@ -184,142 +239,43 @@ def _ocr_numpy_image(
     ocr: PaddleOCR,
     image: np.ndarray,
     page_number: int,
-) -> tuple[dict[str, Any], str, list[float]]:
+) -> tuple[
+    dict[str, Any],
+    str,
+    list[float],
+]:
+    """
+    Run PaddleOCR on an already-rendered image.
 
-    # list(...) makes sure the whole inference finishes while
-    # the lock is held, even if predict() returned a generator.
+    This helper is intentionally kept because the
+    PyMuPDF4LLM adapter can use the same shared PaddleOCR
+    engine.
+
+    It does NOT know anything about PDFs or decide whether
+    OCR is required.
+    """
+
     with OCR_ENGINE_LOCK:
-        results = list(ocr.predict(image))
 
-    for result in results:
-        return _extract_page_result(result, page_number)
-
-    return {"page": page_number, "text": ""}, "", []
-
-
-# ============================================================
-# PDF OCR
-# ============================================================
-
-def _perform_pdf_ocr(
-    file_path: str,
-    ocr: PaddleOCR,
-) -> dict[str, Any]:
-
-    pdf_path = Path(file_path)
-    thread_name = threading.current_thread().name
-
-    pages: list[dict[str, Any]] = []
-    all_text: list[str] = []
-    confidence_values: list[float] = []
-
-    document = fitz.open(str(pdf_path))
-
-    try:
-
-        page_count = len(document)
-
-        if MAX_PDF_PAGES and page_count > MAX_PDF_PAGES:
-            raise ValueError(
-                f"PDF has {page_count} pages; "
-                f"the limit is {MAX_PDF_PAGES}."
-            )
-
-        print(
-            f"[{thread_name}] PDF opened: {pdf_path.name} "
-            f"({page_count} pages, {PDF_DPI} DPI)"
+        results = list(
+            ocr.predict(image)
         )
 
-        for page_index in range(page_count):
+    for result in results:
 
-            page_number = page_index + 1
-            started = time.perf_counter()
+        return _extract_page_result(
+            result,
+            page_number,
+        )
 
-            page = None
-            pixmap = None
-            image_array = None
-
-            try:
-
-                page = document.load_page(page_index)
-
-                # Normal pages use PDF_DPI. Very large pages are
-                # scaled down so the image stays <= MAX_RENDER_SIDE_PX.
-                rect = page.rect
-                longest_side = max(rect.width, rect.height)
-
-                zoom = PDF_DPI / 72.0
-
-                if longest_side > 0:
-                    zoom = min(zoom, MAX_RENDER_SIDE_PX / longest_side)
-
-                pixmap = page.get_pixmap(
-                    matrix=fitz.Matrix(zoom, zoom),
-                    colorspace=fitz.csRGB,
-                    alpha=False,
-                )
-
-                image_array = np.frombuffer(
-                    pixmap.samples,
-                    dtype=np.uint8,
-                ).reshape(
-                    pixmap.height,
-                    pixmap.width,
-                    pixmap.n,
-                )
-
-                (
-                    page_data,
-                    page_text,
-                    page_confidences,
-                ) = _ocr_numpy_image(
-                    ocr,
-                    image_array,
-                    page_number,
-                )
-
-                pages.append(page_data)
-
-                if page_text:
-                    all_text.append(page_text)
-
-                confidence_values.extend(page_confidences)
-
-                print(
-                    f"[{thread_name}] {pdf_path.name} "
-                    f"page {page_number}/{page_count} "
-                    f"({pixmap.width}x{pixmap.height}) "
-                    f"done in {time.perf_counter() - started:.1f}s"
-                )
-
-            finally:
-
-                image_array = None
-                pixmap = None
-                page = None
-
-                gc.collect()
-
-    finally:
-
-        document.close()
-        gc.collect()
-
-    extracted_text = "\n\n".join(all_text)
-
-    average_confidence = (
-        sum(confidence_values) / len(confidence_values)
-        if confidence_values
-        else 0.0
+    return (
+        {
+            "page": page_number,
+            "text": "",
+        },
+        "",
+        [],
     )
-
-    return {
-        "text": extracted_text,
-        "pages": pages,
-        "page_count": len(pages),
-        "confidence": average_confidence,
-        "file_name": pdf_path.name,
-    }
 
 
 # ============================================================
@@ -330,35 +286,70 @@ def _perform_image_ocr(
     file_path: str,
     ocr: PaddleOCR,
 ) -> dict[str, Any]:
+    """
+    Run PaddleOCR directly on an image file.
 
-    print(f"Running OCR on image: {file_path}")
+    This function is for standalone image uploads.
+
+    PDF files DO NOT come through this function.
+    """
+
+    print(
+        f"Running PaddleOCR on image: "
+        f"{file_path}"
+    )
 
     with OCR_ENGINE_LOCK:
-        results = list(ocr.predict(file_path))
 
-    pages: list[dict[str, Any]] = []
+        results = list(
+            ocr.predict(file_path)
+        )
+
+    pages: list[
+        dict[str, Any]
+    ] = []
+
     all_text: list[str] = []
-    confidence_values: list[float] = []
 
-    for page_number, result in enumerate(results, start=1):
+    confidence_values: list[
+        float
+    ] = []
+
+    for page_number, result in enumerate(
+        results,
+        start=1,
+    ):
 
         (
             page_data,
             page_text,
             page_confidences,
-        ) = _extract_page_result(result, page_number)
+        ) = _extract_page_result(
+            result,
+            page_number,
+        )
 
-        pages.append(page_data)
+        pages.append(
+            page_data
+        )
 
         if page_text:
-            all_text.append(page_text)
 
-        confidence_values.extend(page_confidences)
+            all_text.append(
+                page_text
+            )
 
-    extracted_text = "\n\n".join(all_text)
+        confidence_values.extend(
+            page_confidences
+        )
+
+    extracted_text = "\n\n".join(
+        all_text
+    )
 
     average_confidence = (
-        sum(confidence_values) / len(confidence_values)
+        sum(confidence_values)
+        / len(confidence_values)
         if confidence_values
         else 0.0
     )
@@ -368,7 +359,9 @@ def _perform_image_ocr(
         "pages": pages,
         "page_count": len(pages),
         "confidence": average_confidence,
-        "file_name": Path(file_path).name,
+        "file_name": Path(
+            file_path
+        ).name,
     }
 
 
@@ -379,22 +372,316 @@ def _perform_image_ocr(
 def perform_ocr(
     file_path: str,
 ) -> dict[str, Any]:
+    """
+    Public OCR entry point.
 
-    path = Path(file_path)
+    IMPORTANT:
+
+    PDF processing is intentionally NOT implemented here.
+
+    PyMuPDF4LLM will become the PDF processing pipeline.
+
+    Therefore:
+
+        PDF
+         ↓
+        PyMuPDF4LLM
+         ↓
+        PyMuPDF4LLM decides whether OCR is needed
+         ↓
+        PaddleOCR adapter
+         ↓
+        shared PaddleOCR engine
+
+    Standalone image files can still use PaddleOCR directly.
+    """
+
+    path = Path(
+        file_path
+    )
 
     if not path.exists():
+
         raise FileNotFoundError(
-            f"OCR file does not exist: {file_path}"
+            f"OCR file does not exist: "
+            f"{file_path}"
         )
+
+    # --------------------------------------------------------
+    # PDF
+    # --------------------------------------------------------
+    #
+    # Do NOT silently fall back to the old PDF→pixels→OCR
+    # implementation.
+    #
+    # This makes accidental use of the old architecture
+    # impossible.
+    # --------------------------------------------------------
+
+    if path.suffix.lower() == ".pdf":
+
+        raise RuntimeError(
+            "Direct PDF OCR through ocr_service.py "
+            "has been removed. "
+            "PDFs must be processed through "
+            "PyMuPDF4LLM with the PaddleOCR adapter."
+        )
+
+    # --------------------------------------------------------
+    # IMAGE
+    # --------------------------------------------------------
 
     ocr = get_ocr_engine()
 
     print(
         f"[{threading.current_thread().name}] "
-        f"Running OCR on: {path.name}"
+        f"Running PaddleOCR on: "
+        f"{path.name}"
     )
 
-    if path.suffix.lower() == ".pdf":
-        return _perform_pdf_ocr(file_path, ocr)
+    try:
 
-    return _perform_image_ocr(file_path, ocr)
+        return _perform_image_ocr(
+            file_path,
+            ocr,
+        )
+
+    finally:
+
+        gc.collect()
+
+
+# ============================================================
+# PYMUPDF4LLM CUSTOM OCR CALLBACK
+# ============================================================
+#
+# PyMuPDF4LLM remains responsible for:
+#
+#     - deciding whether OCR is required
+#     - rendering the PDF page
+#     - coordinate handling
+#     - OCR text insertion
+#     - continuing PDF extraction
+#
+# Our application is responsible only for:
+#
+#     - running PaddleOCR 3.7.0
+#     - converting PaddleOCR results into the format
+#       expected by PyMuPDF4LLM
+#
+# This does NOT use PyMuPDF4LLM's built-in RapidOCR backend.
+# ============================================================
+
+
+def _convert_paddle_box_to_polygon(
+    box: Any,
+) -> list[list[float]]:
+    """
+    Convert PaddleOCR 3.7.0 rec_boxes format:
+
+        [x1, y1, x2, y2]
+
+    into the polygon format expected by
+    PyMuPDF4LLM:
+
+        [
+            [x1, y1],
+            [x2, y1],
+            [x2, y2],
+            [x1, y2],
+        ]
+    """
+
+    if not isinstance(
+        box,
+        (list, tuple),
+    ):
+        raise ValueError(
+            f"Unexpected PaddleOCR box type: {type(box)}"
+        )
+
+    if len(box) != 4:
+        raise ValueError(
+            f"Expected [x1, y1, x2, y2], got: {box}"
+        )
+
+    x1, y1, x2, y2 = box
+
+    return [
+        [float(x1), float(y1)],
+        [float(x2), float(y1)],
+        [float(x2), float(y2)],
+        [float(x1), float(y2)],
+    ]
+
+
+def paddleocr_full_ocr(
+    image: np.ndarray,
+) -> list[tuple[Any, str, float]]:
+    """
+    Low-level OCR callback used by PyMuPDF4LLM.
+
+    PyMuPDF4LLM supplies the rendered image.
+
+    Our PaddleOCR 3.7.0 engine performs the actual OCR.
+
+    Returns:
+
+        (polygon, text, confidence)
+
+    for each detected text region.
+    """
+
+    ocr = get_ocr_engine()
+
+    # Exactly one shared PaddleOCR engine exists per process.
+    #
+    # Serialize inference because multiple callers may reach
+    # this callback while using the same PaddleOCR instance.
+    with OCR_ENGINE_LOCK:
+
+        results = list(
+            ocr.predict(image)
+        )
+
+    output: list[
+        tuple[Any, str, float]
+    ] = []
+
+    for result in results:
+
+        try:
+            result_data = result.json
+        except Exception:
+            continue
+
+        if callable(result_data):
+
+            try:
+                result_data = result_data()
+            except Exception:
+                continue
+
+        if not isinstance(
+            result_data,
+            dict,
+        ):
+            continue
+
+        data = result_data.get(
+            "res",
+            result_data,
+        )
+
+        if not isinstance(
+            data,
+            dict,
+        ):
+            continue
+
+        boxes = data.get(
+            "rec_boxes",
+            [],
+        )
+
+        texts = data.get(
+            "rec_texts",
+            [],
+        )
+
+        scores = data.get(
+            "rec_scores",
+            [],
+        )
+
+        if not isinstance(
+            boxes,
+            list,
+        ):
+            continue
+
+        if not isinstance(
+            texts,
+            list,
+        ):
+            continue
+
+        if not isinstance(
+            scores,
+            list,
+        ):
+            continue
+
+        count = min(
+            len(boxes),
+            len(texts),
+            len(scores),
+        )
+
+        for index in range(count):
+
+            try:
+                polygon = (
+                    _convert_paddle_box_to_polygon(
+                        boxes[index]
+                    )
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                continue
+
+            text = str(
+                texts[index]
+            ).strip()
+
+            if not text:
+                continue
+
+            try:
+                score = float(
+                    scores[index]
+                )
+            except (
+                TypeError,
+                ValueError,
+            ):
+                continue
+
+            output.append(
+                (
+                    polygon,
+                    text,
+                    score,
+                )
+            )
+
+    return output
+
+
+def paddleocr_ocr_function(
+    page,
+    dpi: int = 150,
+    language: str | None = None,
+    keep_ocr_text: bool = False,
+) -> None:
+    """
+    PyMuPDF4LLM-compatible OCR callback.
+
+    PyMuPDF4LLM calls this function only when its own OCR
+    decision determines that OCR is required.
+
+    PyMuPDF4LLM continues to handle the PDF orchestration.
+
+    This function simply connects PyMuPDF4LLM's generic OCR
+    interface to our custom PaddleOCR 3.7.0 implementation.
+    """
+
+    exec_ocr_full(
+        page,
+        paddleocr_full_ocr,
+        dpi=dpi,
+        language=language,
+        keep_ocr_text=keep_ocr_text,
+    )

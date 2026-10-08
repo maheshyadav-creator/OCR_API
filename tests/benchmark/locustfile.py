@@ -1,14 +1,12 @@
-from __future__ import annotations
-
-import csv
 import os
 import threading
 import time
+import uuid
 from pathlib import Path
-from typing import Any
 
-from locust import HttpUser, between, task
-from locust.exception import StopUser
+import psycopg2
+
+from locust import HttpUser, between, events, task
 
 
 # ============================================================
@@ -16,534 +14,852 @@ from locust.exception import StopUser
 # ============================================================
 
 PROJECT_ROOT = Path(
-    os.getenv(
-        "PROJECT_ROOT",
-        "/home/mahesh/Documents/OCR_API",
-    )
+    "/home/mahesh/Documents/OCR_API"
 )
 
 PDF_DIR = PROJECT_ROOT / "test_pdf"
 
-# EXACTLY 10 users
-EXPECTED_USERS = 10
+PDFS = sorted(
+    PDF_DIR.glob("ocr_test_*.pdf")
+)
 
-UPLOAD_PATH = "/ocr"
+PDFS_PER_USER = int(
+    os.getenv("PDFS_PER_USER", "5")
+)
 
-STATUS_PATH = "/ocr/{job_id}"
+LOCUST_TOTAL_USERS = int(
+    os.getenv("LOCUST_TOTAL_USERS", "1")
+)
 
-FILE_FIELD = "files"
 
-POLL_INTERVAL_SECONDS = float(
+# ============================================================
+# DATABASE MONITOR CONFIGURATION
+# ============================================================
+
+DB_HOST = os.getenv(
+    "LOCUST_DB_HOST",
+    "localhost",
+)
+
+DB_PORT = int(
     os.getenv(
-        "POLL_INTERVAL_SECONDS",
-        "2",
+        "LOCUST_DB_PORT",
+        "5432",
     )
 )
 
-REQUEST_TIMEOUT = float(
+DB_NAME = os.getenv(
+    "LOCUST_DB_NAME",
+    "ocr_db",
+)
+
+DB_USER = os.getenv(
+    "LOCUST_DB_USER",
+    "ocr_user",
+)
+
+DB_PASSWORD = os.getenv(
+    "LOCUST_DB_PASSWORD",
+    "ocr_password",
+)
+
+MONITOR_INTERVAL_SECONDS = float(
     os.getenv(
-        "REQUEST_TIMEOUT",
-        "1800",
+        "LOCUST_MONITOR_INTERVAL",
+        "5",
     )
 )
 
-RESULTS_DIR = PROJECT_ROOT / "benchmark_results"
+# ============================================================
+# PER-RUN STATE
+# ============================================================
 
-LOCUST_RESULTS_FILE = (
-    RESULTS_DIR
-    / "locust_10_users_results.csv"
-)
+# IMPORTANT:
+#
+# These values are reset at every Locust test_start event.
+#
+# This means:
+#
+# START
+#   -> fresh counters
+#
+# STOP
+# START
+#   -> fresh counters again
+#
+# No stale state from the previous run.
+
+LOCUST_RUN_ID = ""
+
+_next_user_number = 0
+_next_pdf_index = 0
+
+_uploaded_jobs = 0
+
+_test_finished = False
+
+_monitor_started = False
+_monitor_lock = threading.Lock()
+# ============================================================
+# LOCKS
+# ============================================================
+
+_user_assignment_lock = threading.Lock()
+
+_pdf_assignment_lock = threading.Lock()
+
+_upload_counter_lock = threading.Lock()
+
+_test_finish_lock = threading.Lock()
 
 
 # ============================================================
-# PDF DISCOVERY
+# LOCUST TEST START
 # ============================================================
 
-def load_pdfs() -> list[Path]:
+@events.test_start.add_listener
+def on_test_start(environment, **kwargs):
     """
-    Load exactly the first 10 PDFs.
+    Reset ALL benchmark state whenever a new Locust
+    test is started.
 
-    The benchmark will NEVER use:
-        - PDF 11+
-        - random PDFs
-        - duplicate PDFs
+    This is important because the Locust web UI can
+    start multiple tests without restarting the Locust
+    process.
     """
 
-    pdfs = sorted(
-        PDF_DIR.glob("*.pdf")
+    global LOCUST_RUN_ID
+    global _next_user_number
+    global _next_pdf_index
+    global _uploaded_jobs
+    global _test_finished
+
+    LOCUST_RUN_ID = (
+        f"LOCUST-{uuid.uuid4().hex[:12].upper()}"
     )
 
-    if len(pdfs) != EXPECTED_USERS:
-        raise RuntimeError(
-            f"STRICT BENCHMARK ERROR: "
-            f"Expected exactly {EXPECTED_USERS} PDFs, "
-            f"but found {len(pdfs)} in {PDF_DIR}"
-        )
-
-    # Extra duplicate filename protection.
-    filenames = [
-        pdf.name
-        for pdf in pdfs
-    ]
-
-    if len(filenames) != len(set(filenames)):
-        raise RuntimeError(
-            "STRICT BENCHMARK ERROR: "
-            "Duplicate PDF filenames detected."
-        )
+    _next_user_number = 0
+    _next_pdf_index = 0
+    _uploaded_jobs = 0
+    _test_finished = False
 
     print()
-    print("=" * 70)
-    print("LOCUST PDF BENCHMARK")
-    print("=" * 70)
+    print("=" * 80)
+    print("LOCUST TEST STARTED")
+    print(f"RUN ID              : {LOCUST_RUN_ID}")
+    print(f"TOTAL USERS         : {LOCUST_TOTAL_USERS}")
+    print(f"PDFs PER USER       : {PDFS_PER_USER}")
     print(
-        f"Expected users : {EXPECTED_USERS}"
+        f"EXPECTED TOTAL JOBS : "
+        f"{LOCUST_TOTAL_USERS * PDFS_PER_USER}"
     )
-    print(
-        f"PDF directory  : {PDF_DIR}"
-    )
-    print(
-        f"PDFs discovered: {len(pdfs)}"
-    )
+    print("=" * 80)
     print()
-    print("PDF assignment:")
-    print("-" * 70)
-
-    for index, pdf in enumerate(
-        pdfs,
-        start=1,
-    ):
-        print(
-            f"User {index:02d} -> "
-            f"{pdf.name}"
-        )
-
-    print("=" * 70)
-    print()
-
-    return pdfs
-
-
-PDFS = load_pdfs()
 
 
 # ============================================================
-# GLOBAL ASSIGNMENT STATE
+# LOCUST TEST STOP
 # ============================================================
 
-assignment_lock = threading.Lock()
+@events.test_stop.add_listener
+@events.test_stop.add_listener
+def on_test_stop(environment, **kwargs):
+    """
+    Print final Locust upload-side information.
+    """
 
-next_pdf_index = 0
+    expected_jobs = (
+        LOCUST_TOTAL_USERS
+        * PDFS_PER_USER
+    )
 
-assigned_pdfs: set[str] = set()
+    print()
+    print("=" * 80)
+    print("LOCUST TEST FINISHED")
+    print(f"RUN ID              : {LOCUST_RUN_ID}")
+    print(
+        f"EXPECTED UPLOADS    : "
+        f"{expected_jobs}"
+    )
+    print(
+        f"ACTUAL UPLOADS      : "
+        f"{_uploaded_jobs}"
+    )
+    print("=" * 80)
+    print()
 
+
+# ============================================================
+# PDF ASSIGNMENT
+# ============================================================
 
 def get_next_pdf() -> Path:
     """
-    Give exactly one unique PDF to each Locust user.
+    Assign exactly one PDF from the global PDF sequence.
 
-    Example:
-
-        User 1  -> ocr_test_01.pdf
-        User 2  -> ocr_test_02.pdf
-        ...
-        User 10 -> ocr_test_10.pdf
-
-    Once all 10 PDFs have been assigned, any additional
-    Locust user causes the benchmark to fail immediately.
+    Assignment is shared across Locust users so that the
+    same PDF is not assigned twice during one run.
     """
 
-    global next_pdf_index
+    global _next_pdf_index
 
-    with assignment_lock:
+    with _pdf_assignment_lock:
 
-        # ----------------------------------------------------
-        # NEVER allow more than 10 assignments.
-        # ----------------------------------------------------
-
-        if next_pdf_index >= EXPECTED_USERS:
-
+        if not PDFS:
             raise RuntimeError(
-                "STRICT BENCHMARK ERROR: "
-                f"More than {EXPECTED_USERS} Locust users "
-                "attempted to receive a PDF."
+                f"No PDFs found in {PDF_DIR}"
             )
 
-        pdf = PDFS[next_pdf_index]
+        pdf = PDFS[
+            _next_pdf_index % len(PDFS)
+        ]
 
-        next_pdf_index += 1
-
-        # ----------------------------------------------------
-        # Duplicate protection.
-        # ----------------------------------------------------
-
-        if pdf.name in assigned_pdfs:
-
-            raise RuntimeError(
-                "STRICT BENCHMARK ERROR: "
-                f"Duplicate PDF assignment detected: "
-                f"{pdf.name}"
-            )
-
-        assigned_pdfs.add(
-            pdf.name
-        )
+        _next_pdf_index += 1
 
         return pdf
 
 
 # ============================================================
-# RESULTS
+# USER NUMBER ASSIGNMENT
 # ============================================================
 
-results_lock = threading.Lock()
+def get_next_user_number() -> int:
+    """
+    Assign a stable sequential number to each Locust user.
+    """
 
-results: list[dict[str, Any]] = []
+    global _next_user_number
+
+    with _user_assignment_lock:
+
+        _next_user_number += 1
+
+        return _next_user_number
 
 
-def save_results() -> None:
+# ============================================================
+# UPLOAD COUNTER
+# ============================================================
 
-    RESULTS_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
+def increment_uploaded_jobs() -> int:
+    """
+    Increment the number of successfully submitted HTTP
+    upload requests.
+
+    Returns the new total.
+    """
+
+    global _uploaded_jobs
+
+    with _upload_counter_lock:
+
+        _uploaded_jobs += 1
+
+        return _uploaded_jobs
+# ============================================================
+# OCR PIPELINE MONITOR
+# ============================================================
+
+def monitor_ocr_pipeline(environment) -> None:
+    """
+    Monitor the asynchronous OCR pipeline directly through
+    PostgreSQL.
+
+    This does NOT use self.client.
+
+    Therefore these monitoring operations do NOT appear as
+    additional Locust HTTP requests.
+
+    The monitor continues until every expected job reaches
+    a terminal state:
+
+        completed
+        failed
+    """
+
+    expected_jobs = (
+        LOCUST_TOTAL_USERS
+        * PDFS_PER_USER
     )
 
-    with results_lock:
-        rows = list(results)
+    print()
+    print("=" * 80)
+    print("OCR PIPELINE MONITOR STARTED")
+    print(f"RUN ID              : {LOCUST_RUN_ID}")
+    print(f"EXPECTED JOBS       : {expected_jobs}")
+    print(
+        f"CHECK INTERVAL      : "
+        f"{MONITOR_INTERVAL_SECONDS}s"
+    )
+    print("=" * 80)
+    print()
 
-    if not rows:
-        return
+    last_state = None
 
-    with LOCUST_RESULTS_FILE.open(
-        "w",
-        newline="",
-        encoding="utf-8",
-    ) as file:
+    while True:
 
-        fieldnames = [
-            "user_id",
-            "filename",
-            "job_id",
-            "upload_start",
-            "upload_end",
-            "end_to_end_seconds",
-            "final_status",
-            "attempt_count",
-            "queue_wait_seconds",
-            "processing_seconds",
-            "error_message",
-        ]
+        try:
 
-        writer = csv.DictWriter(
-            file,
-            fieldnames=fieldnames,
+            connection = psycopg2.connect(
+                host=DB_HOST,
+                port=DB_PORT,
+                database=DB_NAME,
+                user=DB_USER,
+                password=DB_PASSWORD,
+                connect_timeout=5,
+            )
+
+            try:
+
+                with connection.cursor() as cursor:
+
+                    cursor.execute(
+                        """
+                        SELECT
+                            COUNT(*) AS total_jobs,
+
+                            COUNT(*) FILTER (
+                                WHERE status = 'completed'
+                            ) AS completed_jobs,
+
+                            COUNT(*) FILTER (
+                                WHERE status = 'processing'
+                            ) AS processing_jobs,
+
+                            COUNT(*) FILTER (
+                                WHERE status = 'queued'
+                            ) AS queued_jobs,
+
+                            COUNT(*) FILTER (
+                                WHERE status = 'retrying'
+                            ) AS retrying_jobs,
+
+                            COUNT(*) FILTER (
+                                WHERE status = 'failed'
+                            ) AS failed_jobs
+
+                        FROM ocr_jobs
+
+                        WHERE locust_run_id = %s
+                        """,
+                        (
+                            LOCUST_RUN_ID,
+                        ),
+                    )
+
+                    row = cursor.fetchone()
+
+            finally:
+
+                connection.close()
+
+            (
+                total_jobs,
+                completed_jobs,
+                processing_jobs,
+                queued_jobs,
+                retrying_jobs,
+                failed_jobs,
+            ) = row
+
+            state = (
+                total_jobs,
+                completed_jobs,
+                processing_jobs,
+                queued_jobs,
+                retrying_jobs,
+                failed_jobs,
+            )
+
+            # ------------------------------------------------
+            # Only print when something changed.
+            # ------------------------------------------------
+
+            if state != last_state:
+
+                print()
+                print(
+                    f"[OCR PIPELINE] "
+                    f"RUN {LOCUST_RUN_ID}"
+                )
+
+                print(
+                    f"  Uploaded/Jobs : "
+                    f"{total_jobs}/{expected_jobs}"
+                )
+
+                print(
+                    f"  Completed     : "
+                    f"{completed_jobs}/{expected_jobs}"
+                )
+
+                print(
+                    f"  Processing    : "
+                    f"{processing_jobs}"
+                )
+
+                print(
+                    f"  Queued        : "
+                    f"{queued_jobs}"
+                )
+
+                print(
+                    f"  Retrying      : "
+                    f"{retrying_jobs}"
+                )
+
+                print(
+                    f"  Failed        : "
+                    f"{failed_jobs}"
+                )
+
+                last_state = state
+
+            # ------------------------------------------------
+            # Terminal condition.
+            #
+            # Every job must be either:
+            #
+            # completed OR failed
+            #
+            # This means there is no queued, processing or
+            # retrying work left.
+            # ------------------------------------------------
+
+            terminal_jobs = (
+                completed_jobs
+                + failed_jobs
+            )
+
+            if (
+                total_jobs == expected_jobs
+                and terminal_jobs == expected_jobs
+            ):
+
+                print()
+                print("=" * 80)
+                print("OCR PIPELINE FINISHED")
+                print(f"RUN ID              : {LOCUST_RUN_ID}")
+                print(
+                    f"TOTAL JOBS          : "
+                    f"{total_jobs}"
+                )
+                print(
+                    f"COMPLETED           : "
+                    f"{completed_jobs}"
+                )
+                print(
+                    f"FAILED              : "
+                    f"{failed_jobs}"
+                )
+                print(
+                    f"PROCESSING          : "
+                    f"{processing_jobs}"
+                )
+                print(
+                    f"QUEUED              : "
+                    f"{queued_jobs}"
+                )
+                print(
+                    f"RETRYING            : "
+                    f"{retrying_jobs}"
+                )
+                print("=" * 80)
+                print()
+
+                environment.runner.quit()
+
+                return
+
+        except Exception as exc:
+
+            print(
+                f"[OCR PIPELINE MONITOR] "
+                f"Database check failed: {exc}"
+            )
+
+        time.sleep(
+            MONITOR_INTERVAL_SECONDS
         )
 
-        writer.writeheader()
+# ============================================================
+# FINISH TEST
+# ============================================================
+# ============================================================
+# FINISH UPLOAD PHASE
+# ============================================================
 
-        for row in rows:
-            writer.writerow(row)
+def finish_test_if_complete(environment) -> None:
+    """
+    Called after every successful upload.
 
-    print(
-        f"Locust results written to: "
-        f"{LOCUST_RESULTS_FILE}"
+    Once all expected PDFs have been submitted, we DO NOT
+    stop Locust immediately.
+
+    Instead we start a background PostgreSQL monitor.
+
+    The monitor waits for Celery/PyMuPDF4LLM/PaddleOCR to
+    finish all jobs.
+    """
+
+    global _test_finished
+    global _monitor_started
+
+    expected_jobs = (
+        LOCUST_TOTAL_USERS
+        * PDFS_PER_USER
     )
+
+    with _test_finish_lock:
+
+        if _uploaded_jobs < expected_jobs:
+            return
+
+        _test_finished = True
+
+        print()
+        print("=" * 80)
+        print("ALL EXPECTED UPLOADS SUBMITTED")
+        print(f"RUN ID           : {LOCUST_RUN_ID}")
+        print(
+            f"EXPECTED UPLOADS : "
+            f"{expected_jobs}"
+        )
+        print(
+            f"ACTUAL UPLOADS   : "
+            f"{_uploaded_jobs}"
+        )
+        print("=" * 80)
+        print()
+
+        # ----------------------------------------------------
+        # Start OCR pipeline monitor only once.
+        # ----------------------------------------------------
+
+        if _monitor_started:
+            return
+
+        _monitor_started = True
+
+        monitor_thread = threading.Thread(
+            target=monitor_ocr_pipeline,
+            args=(environment,),
+            daemon=True,
+            name="ocr-pipeline-monitor",
+        )
+
+        monitor_thread.start()
+
 
 
 # ============================================================
 # LOCUST USER
 # ============================================================
 
-class OcrUser(HttpUser):
+class OcrApiUser(HttpUser):
 
-    wait_time = between(
-        0,
-        0,
-    )
+    # No artificial delay between uploads.
+    wait_time = between(0, 0)
+
+    # --------------------------------------------------------
+    # USER START
+    # --------------------------------------------------------
 
     def on_start(self) -> None:
-        """
-        Called once when this Locust user starts.
 
-        Each user gets exactly ONE unique PDF.
-        """
+        # ----------------------------------------------------
+        # Assign stable user number.
+        # ----------------------------------------------------
 
-        self.pdf_path = get_next_pdf()
-
-        print(
-            f"[USER ASSIGNMENT] "
-            f"{self.pdf_path.name}"
+        self.user_number = (
+            get_next_user_number()
         )
 
-    @task
-    def upload_one_pdf(self) -> None:
-        """
-        Upload exactly ONE PDF.
+        # ----------------------------------------------------
+        # IMPORTANT:
+        #
+        # The number of users is determined by the environment
+        # variable, NOT by how many users have already started.
+        #
+        # Example:
+        #
+        # LOCUST_TOTAL_USERS=4
+        #
+        # Every user knows:
+        #
+        # TOTAL USERS = 4
+        # ----------------------------------------------------
 
-        After this task finishes, StopUser is raised.
+        self.total_users = (
+            LOCUST_TOTAL_USERS
+        )
 
-        Therefore this user can NEVER upload a second PDF.
-        """
+        # ----------------------------------------------------
+        # Assign exactly PDFS_PER_USER PDFs.
+        # ----------------------------------------------------
 
-        pdf_path = self.pdf_path
+        self.pdf_paths: list[Path] = []
+
+        for _ in range(PDFS_PER_USER):
+
+            self.pdf_paths.append(
+                get_next_pdf()
+            )
+
+        self.current_pdf_index = 0
+
+        self.finished_work = False
+
+        # ----------------------------------------------------
+        # Print user information.
+        # ----------------------------------------------------
+
+        expected_jobs = (
+            self.total_users
+            * PDFS_PER_USER
+        )
 
         print()
-        print("=" * 70)
+        print("-" * 70)
+        print("LOCUST USER STARTED")
+        print(f"RUN ID              : {LOCUST_RUN_ID}")
         print(
-            f"Uploading: {pdf_path.name}"
+            f"USER                : "
+            f"{self.user_number}/{self.total_users}"
         )
-        print("=" * 70)
+        print(
+            f"PDFs per user       : "
+            f"{PDFS_PER_USER}"
+        )
+        print(
+            f"EXPECTED TOTAL JOBS : "
+            f"{expected_jobs}"
+        )
+        print("-" * 70)
+        print()
 
-        upload_start = time.perf_counter()
+    # ========================================================
+    # UPLOAD ONE PDF
+    # ========================================================
 
-        job_id = None
+    @task
+    def upload_pdf(self) -> None:
 
-        final_status = "failed"
+        # ----------------------------------------------------
+        # If this user has completed its workload, DO NOT STOP
+        # THE USER.
+        #
+        # IMPORTANT:
+        #
+        # self.stop()
+        #
+        # was the cause of Locust creating users 5,6,7...
+        #
+        # Instead we simply return.
+        #
+        # The user remains alive and does not generate another
+        # upload because finished_work=True.
+        # ----------------------------------------------------
 
-        attempt_count = 0
+        if self.finished_work:
+            return
 
-        queue_wait_seconds = ""
+        # ----------------------------------------------------
+        # Safety check.
+        # ----------------------------------------------------
 
-        processing_seconds = ""
+        if (
+            self.current_pdf_index
+            >= len(self.pdf_paths)
+        ):
 
-        error_message = ""
+            self.finished_work = True
 
-        try:
+            return
+
+        # ----------------------------------------------------
+        # Select next PDF.
+        # ----------------------------------------------------
+
+        pdf_number = (
+            self.current_pdf_index + 1
+        )
+
+        pdf_path = self.pdf_paths[
+            self.current_pdf_index
+        ]
+
+        self.current_pdf_index += 1
+
+        # ----------------------------------------------------
+        # Expected total jobs.
+        # ----------------------------------------------------
+
+        expected_jobs = (
+            self.total_users
+            * PDFS_PER_USER
+        )
+
+        # ----------------------------------------------------
+        # Print upload information.
+        # ----------------------------------------------------
+
+        print(
+            f"[LOCUST RUN {LOCUST_RUN_ID}] "
+            f"USER {self.user_number}/"
+            f"{self.total_users} "
+            f"PDF {pdf_number}/"
+            f"{PDFS_PER_USER} "
+            f"-> {pdf_path.name}"
+        )
+
+        # ----------------------------------------------------
+        # Headers sent to FastAPI.
+        # ----------------------------------------------------
+
+        headers = {
+
+            "X-Locust-Run-ID":
+                LOCUST_RUN_ID,
+
+            "X-Locust-User-ID":
+                str(id(self)),
+
+            "X-Locust-User-Number":
+                str(self.user_number),
+
+            "X-Locust-Total-Users":
+                str(self.total_users),
+
+            "X-Locust-PDF-Number":
+                str(pdf_number),
+
+            "X-Locust-PDFs-Per-User":
+                str(PDFS_PER_USER),
+
+            "X-Locust-Expected-Jobs":
+                str(expected_jobs),
+        }
+
+        # ----------------------------------------------------
+        # Upload PDF.
+        # ----------------------------------------------------
+
+        with pdf_path.open("rb") as pdf_file:
+
+            response = self.client.post(
+                "/ocr",
+                files={
+                    "files": (
+                        pdf_path.name,
+                        pdf_file,
+                        "application/pdf",
+                    )
+                },
+                headers=headers,
+                name="OCR Upload",
+                timeout=60,
+            )
+
+        # ----------------------------------------------------
+        # Process response.
+        # ----------------------------------------------------
+
+        if response.ok:
 
             # ------------------------------------------------
-            # SUBMIT EXACTLY ONE PDF
+            # Count this upload.
+            #
+            # This is an HTTP submission count.
+            #
+            # It is NOT yet an OCR-completed count because
+            # your API is asynchronous.
             # ------------------------------------------------
 
-            with pdf_path.open(
-                "rb"
-            ) as pdf_file:
-
-                response = self.client.post(
-                    UPLOAD_PATH,
-                    files={
-                        FILE_FIELD: (
-                            pdf_path.name,
-                            pdf_file,
-                            "application/pdf",
-                        )
-                    },
-                    name="POST /ocr",
-                    timeout=REQUEST_TIMEOUT,
-                )
-
-            upload_end = time.perf_counter()
-
-            if response.status_code != 202:
-
-                error_message = (
-                    f"Upload failed: "
-                    f"HTTP {response.status_code}: "
-                    f"{response.text}"
-                )
-
-                raise RuntimeError(
-                    error_message
-                )
-
-            body = response.json()
-
-            jobs = body.get(
-                "jobs",
-                [],
+            total_uploaded = (
+                increment_uploaded_jobs()
             )
 
             # ------------------------------------------------
-            # API MUST RETURN EXACTLY ONE JOB.
+            # Print API response.
             # ------------------------------------------------
 
-            if len(jobs) != 1:
+            try:
 
-                raise RuntimeError(
-                    "STRICT BENCHMARK ERROR: "
-                    f"Expected exactly 1 job, "
-                    f"but API returned {len(jobs)} jobs."
+                response_data = (
+                    response.json()
                 )
 
-            job_id = jobs[0]["job_id"]
-
-            print(
-                f"Uploaded: {pdf_path.name}"
-            )
-
-            print(
-                f"Job ID: {job_id}"
-            )
-
-            # ------------------------------------------------
-            # WAIT FOR THIS EXACT JOB
-            # ------------------------------------------------
-
-            while True:
-
-                time.sleep(
-                    POLL_INTERVAL_SECONDS
+                jobs = response_data.get(
+                    "jobs",
+                    [],
                 )
 
-                status_response = self.client.get(
-                    STATUS_PATH.format(
-                        job_id=job_id
-                    ),
-                    name="GET /ocr/{job_id}",
-                    timeout=REQUEST_TIMEOUT,
-                )
+                if jobs:
 
-                if status_response.status_code != 200:
-
-                    raise RuntimeError(
-                        "Status request failed: "
-                        f"HTTP "
-                        f"{status_response.status_code}"
+                    job_id = jobs[0].get(
+                        "job_id",
+                        "unknown",
                     )
 
-                status_data = (
-                    status_response.json()
-                )
-
-                current_status = (
-                    status_data.get(
-                        "status"
-                    )
-                )
-
-                attempt_count = int(
-                    status_data.get(
-                        "attempt_count",
-                        0,
-                    )
-                )
-
-                created_at = (
-                    status_data.get(
-                        "created_at"
-                    )
-                )
-
-                started_at = (
-                    status_data.get(
-                        "started_at"
-                    )
-                )
-
-                completed_at = (
-                    status_data.get(
-                        "completed_at"
-                    )
-                )
-
-                if (
-                    current_status
-                    == "completed"
-                ):
-
-                    final_status = "completed"
-
-                    if (
-                        created_at
-                        and started_at
-                    ):
-                        queue_wait_seconds = (
-                            "calculated_from_server"
-                        )
-
-                    if (
-                        started_at
-                        and completed_at
-                    ):
-                        processing_seconds = (
-                            "calculated_from_server"
-                        )
-
-                    break
-
-                if (
-                    current_status
-                    == "failed"
-                ):
-
-                    final_status = "failed"
-
-                    error_message = (
-                        status_data.get(
-                            "error_message",
-                            "",
-                        )
-                        or ""
+                    print(
+                        f"[LOCUST RUN {LOCUST_RUN_ID}] "
+                        f"USER {self.user_number}/"
+                        f"{self.total_users} "
+                        f"PDF {pdf_number}/"
+                        f"{PDFS_PER_USER} "
+                        f"JOB {job_id} "
+                        f"STATUS queued "
+                        f"TOTAL UPLOADED "
+                        f"{total_uploaded}/"
+                        f"{expected_jobs}"
                     )
 
-                    break
+            except Exception:
 
                 print(
-                    f"{pdf_path.name}: "
-                    f"{current_status}"
+                    f"[LOCUST RUN {LOCUST_RUN_ID}] "
+                    f"Upload succeeded but response "
+                    f"could not be parsed."
                 )
 
-        except Exception as exc:
+            # ------------------------------------------------
+            # Mark this user as finished after its assigned
+            # PDFs have all been uploaded.
+            # ------------------------------------------------
 
-            final_status = "failed"
+            if (
+                self.current_pdf_index
+                >= len(self.pdf_paths)
+            ):
 
-            error_message = str(exc)
+                self.finished_work = True
+
+                print(
+                    f"[LOCUST RUN {LOCUST_RUN_ID}] "
+                    f"USER {self.user_number}/"
+                    f"{self.total_users} "
+                    f"FINISHED "
+                    f"{PDFS_PER_USER} PDFs"
+                )
+
+            # ------------------------------------------------
+            # If ALL expected uploads are done, stop the
+            # ENTIRE Locust test.
+            # ------------------------------------------------
+
+            finish_test_if_complete(
+                self.environment
+            )
+
+        else:
 
             print(
-                f"ERROR processing "
-                f"{pdf_path.name}: "
-                f"{exc}"
+                f"[LOCUST RUN {LOCUST_RUN_ID}] "
+                f"USER {self.user_number}/"
+                f"{self.total_users} "
+                f"PDF {pdf_number}/"
+                f"{PDFS_PER_USER} "
+                f"UPLOAD FAILED "
+                f"HTTP {response.status_code}"
             )
-
-        finally:
-
-            upload_end = time.perf_counter()
-
-            end_to_end_seconds = (
-                upload_end
-                - upload_start
-            )
-
-            result = {
-                "user_id": str(
-                    getattr(
-                        self,
-                        "user_id",
-                        "",
-                    )
-                ),
-                "filename": pdf_path.name,
-                "job_id": job_id or "",
-                "upload_start": upload_start,
-                "upload_end": upload_end,
-                "end_to_end_seconds": round(
-                    end_to_end_seconds,
-                    3,
-                ),
-                "final_status": final_status,
-                "attempt_count": attempt_count,
-                "queue_wait_seconds": queue_wait_seconds,
-                "processing_seconds": processing_seconds,
-                "error_message": error_message,
-            }
-
-            with results_lock:
-                results.append(result)
-
-            print()
-            print(
-                f"{pdf_path.name} finished: "
-                f"{final_status}"
-            )
-
-            print(
-                f"End-to-end: "
-                f"{end_to_end_seconds:.2f}s"
-            )
-
-            # =================================================
-            # CRITICAL:
-            #
-            # This user is permanently stopped after ONE PDF.
-            # =================================================
-
-            raise StopUser()
